@@ -62,15 +62,15 @@ front doors.
   WhatsApp Business/Twilio Sandbox API later — Twilio's WhatsApp
   Sandbox is free for dev/testing)
 - Razorpay **test-mode** API keys — free, no real money moves
-- Any MCP-compatible desktop client (free tier) — used as the MCP
-  client to demo the AI-buyer flow live
+- Any MCP-compatible desktop client (a free-tier one works fine) —
+  used as the MCP client to demo the AI-buyer flow live
 
 ## Running it locally
 
 ### 1. Backend
 ```bash
 cd backend
-python3 -m venv venv && source venv/bin/activate
+python3 -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 cp ../.env.example ../.env   # fill in Razorpay TEST keys, or leave blank for mock mode
 uvicorn app.main:app --port 8123
@@ -84,7 +84,7 @@ Try: `catalog` → `add sku_001` → `cart` → `checkout`, and separately
 ### 3. AI buyer demo (MCP)
 ```bash
 cd mcp_server
-python3 -m venv venv && source venv/bin/activate
+python3 -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 Then point your MCP client's config at `server.py` — see

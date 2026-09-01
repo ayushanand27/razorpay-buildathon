@@ -34,7 +34,7 @@ class AddToCartRequest(BaseModel):
 class CheckoutRequest(BaseModel):
     session_id: str
     actor: str
-    customer_contact: str = "9999999999"
+    customer_contact: str = "9876543210"
     simulate_failure: bool = False
 
 

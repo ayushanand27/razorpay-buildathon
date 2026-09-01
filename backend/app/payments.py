@@ -10,8 +10,15 @@ deliberately-triggerable failure path used in the pitch video demo
 """
 
 import os
+from pathlib import Path
+
 import requests
+from dotenv import load_dotenv
 from requests.auth import HTTPBasicAuth
+
+# FastAPI/uvicorn does not auto-load .env files -- load it explicitly.
+# .env lives at the project root, one level above backend/.
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "")
 RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "")

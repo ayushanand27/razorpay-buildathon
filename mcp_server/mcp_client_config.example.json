@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "demo-merchant": {
-      "command": "/ABSOLUTE/PATH/TO/razorpay-agentic-commerce/mcp_server/venv/bin/python",
-      "args": ["/ABSOLUTE/PATH/TO/razorpay-agentic-commerce/mcp_server/server.py"],
+      "command": "C:/Users/adity/Downloads/RAZORPAY/razorpay-agentic-commerce/mcp_server/venv/Scripts/python.exe",
+      "args": ["C:/Users/adity/Downloads/RAZORPAY/razorpay-agentic-commerce/mcp_server/server.py"],
       "env": {
         "BACKEND_URL": "http://127.0.0.1:8123"
       }
