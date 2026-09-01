@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Merchant Chat — Human Buyer Demo</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:#e5ddd5; margin:0; }
+  .phone { max-width: 420px; margin: 20px auto; background:#fff; border-radius:12px; overflow:hidden; box-shadow:0 4px 20px rgba(0,0,0,.2); }
+  .header { background:#075e54; color:#fff; padding:14px 16px; font-weight:600; }
+  .header small { display:block; font-weight:400; opacity:.8; font-size:12px; }
+  #log { height: 480px; overflow-y:auto; padding:12px; background:#e5ddd5; }
+  .msg { max-width:75%; padding:8px 12px; border-radius:8px; margin:6px 0; font-size:14px; line-height:1.4; white-space:pre-wrap; }
+  .bot { background:#fff; margin-right:auto; }
+  .user { background:#dcf8c6; margin-left:auto; }
+  .sys { background:#fff3cd; margin:6px auto; text-align:center; font-size:12px; color:#856404; max-width:90%; }
+  #inputRow { display:flex; border-top:1px solid #ddd; }
+  #inputBox { flex:1; padding:12px; border:none; outline:none; font-size:14px; }
+  #sendBtn { background:#075e54; color:#fff; border:none; padding:0 20px; cursor:pointer; }
+  .quick { display:flex; flex-wrap:wrap; gap:6px; padding:8px 12px; }
+  .quick button { background:#128c7e; color:#fff; border:none; border-radius:14px; padding:6px 12px; font-size:12px; cursor:pointer; }
+</style>
+</head>
+<body>
+<div class="phone">
+  <div class="header">Demo Merchant Store <small>simulated WhatsApp checkout — human buyer flow</small></div>
+  <div id="log"></div>
+  <div class="quick">
+    <button onclick="send('catalog')">Show catalog</button>
+    <button onclick="send('cart')">View cart</button>
+    <button onclick="send('checkout')">Checkout</button>
+    <button onclick="send('fail demo')">Trigger failure demo</button>
+  </div>
+  <div id="inputRow">
+    <input id="inputBox" placeholder="Type a message..." onkeydown="if(event.key==='Enter')send()"/>
+    <button id="sendBtn" onclick="send()">Send</button>
+  </div>
+</div>
+
+<script>
+const BACKEND = "http://127.0.0.1:8123";
+const SESSION_ID = "whatsapp_" + Math.random().toString(36).slice(2, 8);
+const ACTOR = "human_whatsapp";
+
+function log(text, cls) {
+  const el = document.createElement('div');
+  el.className = 'msg ' + cls;
+  el.textContent = text;
+  document.getElementById('log').appendChild(el);
+  document.getElementById('log').scrollTop = 1e9;
+}
+
+function sys(text) { log(text, 'sys'); }
+function bot(text) { log(text, 'bot'); }
+
+async function api(path, opts) {
+  const res = await fetch(BACKEND + path, opts);
+  return res.json();
+}
+
+async function showCatalog() {
+  const data = await api('/catalog');
+  let txt = "Here's what we have:\n\n";
+  data.products.forEach(p => {
+    txt += `${p.id} — ${p.name} — Rs.${p.price_inr} ${p.stock === 0 ? '(OUT OF STOCK)' : ''}\n`;
+  });
+  txt += "\nReply like: add sku_001";
+  bot(txt);
+}
+
+async function addItem(sku) {
+  const data = await api('/cart/add', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({session_id: SESSION_ID, actor: ACTOR, product_id: sku, qty: 1})
+  });
+  if (data.detail) { bot("Couldn't add that: " + data.detail); return; }
+  bot(`Added! Cart total: Rs.${data.total_inr}`);
+}
+
+async function showCart() {
+  const data = await api('/cart/' + SESSION_ID);
+  if (!data.cart.length) { bot("Your cart is empty."); return; }
+  let txt = "Your cart:\n";
+  data.cart.forEach(l => txt += `${l.name} x${l.qty} — Rs.${l.qty*l.price_inr}\n`);
+  txt += `\nTotal: Rs.${data.total_inr}`;
+  bot(txt);
+}
+
+async function doCheckout(simulateFailure=false) {
+  sys("[audit] checkout_attempt logged");
+  const data = await api('/checkout', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({session_id: SESSION_ID, actor: ACTOR, simulate_failure: simulateFailure})
+  });
+  if (data.detail) { bot("Checkout failed: " + data.detail); sys("[audit] failure logged"); return; }
+  if (data.note && data.note.includes('recovered')) {
+    sys("[audit] first attempt failed, agent retried automatically — recovered");
+  }
+  bot(`All set! Pay here: ${data.payment_link}\nAmount: Rs.${data.amount_inr}`);
+  sys("[audit] checkout_payment logged");
+}
+
+async function send(preset) {
+  const box = document.getElementById('inputBox');
+  const text = preset || box.value.trim();
+  if (!text) return;
+  log(text, 'user');
+  box.value = '';
+
+  if (text === 'catalog') return showCatalog();
+  if (text === 'cart') return showCart();
+  if (text === 'checkout') return doCheckout(false);
+  if (text === 'fail demo') return doCheckout(true);
+  if (text.startsWith('add ')) return addItem(text.split(' ')[1].trim());
+
+  bot("Try: 'catalog', 'add sku_001', 'cart', 'checkout', or 'fail demo'.");
+}
+
+bot("Hi! Welcome to Demo Merchant Store 👋\nType 'catalog' to see products.");
+</script>
+</body>
+</html>
