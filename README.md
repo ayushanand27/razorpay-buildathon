@@ -79,7 +79,10 @@ uvicorn app.main:app --port 8123
 ### 2. Human buyer demo
 Just open `web_chat/index.html` in a browser (backend must be running).
 Try: `catalog` → `add sku_001` → `cart` → `checkout`, and separately
-`fail demo` to see the graceful-retry path.
+`fail demo` to see the graceful-retry path. Two more pages sit alongside
+it (same nav strip to jump between all three): `web_chat/catalog.html`
+is a live product grid, and `web_chat/audit-dashboard.html` is a
+readable, auto-refreshing view of the audit trail.
 
 ### 3. AI buyer demo (MCP)
 ```bash

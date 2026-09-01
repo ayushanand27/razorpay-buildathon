@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Demo Merchant — Catalog</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    background: #faf9f7;
+    color: #26262b;
+    margin: 0;
+  }
+  .nav {
+    display: flex; gap: 20px; align-items: center;
+    padding: 14px 24px;
+    background: #1f2430;
+    color: #fff;
+  }
+  .nav a {
+    color: #cfd3dc; text-decoration: none; font-size: 14px; font-weight: 500;
+  }
+  .nav a.active { color: #fff; border-bottom: 2px solid #6a5cff; padding-bottom: 3px; }
+  .nav a:hover { color: #fff; }
+  .wrap { max-width: 1000px; margin: 0 auto; padding: 32px 24px 60px; }
+  .page-header { margin-bottom: 28px; }
+  .page-header h1 { font-size: 24px; margin: 0 0 6px; }
+  .page-header p { margin: 0; color: #6b6b75; font-size: 14px; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 18px;
+  }
+  .card {
+    background: #fff;
+    border: 1px solid #ece9e4;
+    border-radius: 12px;
+    padding: 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    transition: box-shadow .15s ease;
+  }
+  .card:hover { box-shadow: 0 4px 16px rgba(0,0,0,.06); }
+  .card.oos { opacity: .55; }
+  .thumb {
+    width: 48px; height: 48px; border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 22px; color: #fff;
+  }
+  .name { font-weight: 600; font-size: 15px; }
+  .meta { font-size: 12px; color: #8a8a92; }
+  .meta .category { text-transform: capitalize; }
+  .price-row { display: flex; align-items: center; justify-content: space-between; margin-top: auto; }
+  .price { font-size: 17px; font-weight: 700; color: #1f2430; }
+  .badge {
+    font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 999px;
+  }
+  .badge.in-stock { background: #e6f4ea; color: #1e7a34; }
+  .badge.out-of-stock { background: #fdecea; color: #b3261e; }
+  .cta-row { margin-top: 32px; text-align: center; }
+  .chat-btn {
+    display: inline-block;
+    background: #6a5cff; color: #fff; text-decoration: none;
+    padding: 12px 28px; border-radius: 999px; font-weight: 600; font-size: 14px;
+  }
+  .chat-btn:hover { background: #5a4ce0; }
+  .loading, .error { color: #8a8a92; font-size: 14px; padding: 40px 0; text-align: center; }
+</style>
+</head>
+<body>
+<div class="nav">
+  <a href="catalog.html" class="active">Catalog</a>
+  <a href="index.html">Chat</a>
+  <a href="audit-dashboard.html">Audit Trail</a>
+</div>
+
+<div class="wrap">
+  <div class="page-header">
+    <h1>Demo Merchant Store</h1>
+    <p>Live catalog, pulled straight from the backend — nothing on this page is hardcoded.</p>
+  </div>
+  <div id="grid" class="grid"><div class="loading">Loading products…</div></div>
+  <div class="cta-row">
+    <a class="chat-btn" href="index.html">Chat to buy</a>
+  </div>
+</div>
+
+<script>
+const BACKEND = "http://127.0.0.1:8123";
+
+// Same category colour/icon scheme as index.html, so the two pages read
+// as one product.
+const CATEGORY_THUMB = {
+  electronics: { color: '#4a90d9', icon: '⚡' },
+  apparel:     { color: '#e07b39', icon: '👕' },
+  home:        { color: '#43a047', icon: '🏠' },
+  stationery:  { color: '#8e44ad', icon: '📓' },
+};
+
+function escapeHTML(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+async function loadCatalog() {
+  const grid = document.getElementById('grid');
+  try {
+    const res = await fetch(BACKEND + '/catalog');
+    const data = await res.json();
+    if (!data.products || !data.products.length) {
+      grid.innerHTML = '<div class="loading">No products found.</div>';
+      return;
+    }
+    grid.innerHTML = data.products.map(p => {
+      const thumb = CATEGORY_THUMB[p.category] || { color: '#999', icon: '🛒' };
+      const oos = p.stock === 0;
+      return `
+        <div class="card ${oos ? 'oos' : ''}">
+          <div class="thumb" style="background:${thumb.color}">${thumb.icon}</div>
+          <div class="name">${escapeHTML(p.name)}</div>
+          <div class="meta"><span class="category">${escapeHTML(p.category)}</span> · ${escapeHTML(p.id)}</div>
+          <div class="price-row">
+            <span class="price">Rs.${p.price_inr}</span>
+            <span class="badge ${oos ? 'out-of-stock' : 'in-stock'}">${oos ? 'Out of stock' : 'In stock'}</span>
+          </div>
+        </div>`;
+    }).join('');
+  } catch (err) {
+    grid.innerHTML = '<div class="error">Could not reach the backend at ' + BACKEND + '. Is it running?</div>';
+  }
+}
+
+loadCatalog();
+</script>
+</body>
+</html>

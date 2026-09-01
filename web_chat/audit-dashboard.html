@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Demo Merchant — Audit Trail</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    background: #faf9f7;
+    color: #26262b;
+    margin: 0;
+  }
+  .nav {
+    display: flex; gap: 20px; align-items: center;
+    padding: 14px 24px;
+    background: #1f2430;
+    color: #fff;
+  }
+  .nav a { color: #cfd3dc; text-decoration: none; font-size: 14px; font-weight: 500; }
+  .nav a.active { color: #fff; border-bottom: 2px solid #6a5cff; padding-bottom: 3px; }
+  .nav a:hover { color: #fff; }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 32px 24px 60px; }
+  .page-header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 20px; flex-wrap: wrap; gap: 8px; }
+  .page-header h1 { font-size: 24px; margin: 0 0 6px; }
+  .page-header p { margin: 0; color: #6b6b75; font-size: 14px; }
+  .live-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #1e7a34; margin-right: 6px; animation: pulse 1.5s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+  table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 12px; overflow: hidden; border: 1px solid #ece9e4; }
+  th, td { text-align: left; padding: 10px 14px; font-size: 13px; border-bottom: 1px solid #f1efec; }
+  th { background: #f4f2ee; color: #6b6b75; font-weight: 600; text-transform: uppercase; font-size: 11px; letter-spacing: .03em; }
+  tr:last-child td { border-bottom: none; }
+  .badge { display: inline-block; font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 999px; }
+  .badge.human { background: #e8ecfd; color: #3346c4; }
+  .badge.ai { background: #f1e6fd; color: #7a2fc4; }
+  .status { display: inline-block; font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 999px; text-transform: capitalize; }
+  .status.ok { background: #e6f4ea; color: #1e7a34; }
+  .status.blocked, .status.failed { background: #fdecea; color: #b3261e; }
+  .status.retried { background: #fff6dd; color: #96720c; }
+  .amount { font-variant-numeric: tabular-nums; }
+  .details { color: #6b6b75; }
+  .loading, .error, .empty { color: #8a8a92; font-size: 14px; padding: 40px 0; text-align: center; }
+</style>
+</head>
+<body>
+<div class="nav">
+  <a href="catalog.html">Catalog</a>
+  <a href="index.html">Chat</a>
+  <a href="audit-dashboard.html" class="active">Audit Trail</a>
+</div>
+
+<div class="wrap">
+  <div class="page-header">
+    <div>
+      <h1>Audit Trail</h1>
+      <p><span class="live-dot"></span>Auto-refreshing every 5s — every action from both the human and AI buyer flows, in order.</p>
+    </div>
+  </div>
+  <div id="tableWrap"><div class="loading">Loading…</div></div>
+</div>
+
+<script>
+const BACKEND = "http://127.0.0.1:8123";
+const REFRESH_MS = 5000;
+
+function escapeHTML(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function formatTime(unixSeconds) {
+  const d = new Date(unixSeconds * 1000);
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function actorBadge(actor) {
+  const isAI = actor === 'ai_agent_mcp';
+  return `<span class="badge ${isAI ? 'ai' : 'human'}">${isAI ? 'AI Agent' : 'Human'}</span>`;
+}
+
+function statusBadge(status) {
+  return `<span class="status ${escapeHTML(status)}">${escapeHTML(status)}</span>`;
+}
+
+function formatDetails(action, status, detailsRaw) {
+  let details = {};
+  try { details = JSON.parse(detailsRaw || '{}'); } catch (e) { /* leave empty */ }
+
+  if (status === 'blocked' || status === 'failed') return escapeHTML(details.reason || 'blocked');
+  if (details.note) return escapeHTML(details.note);
+  if (action === 'add_to_cart' && details.product_id) return `added ${escapeHTML(details.product_id)} x${details.qty}`;
+  if (details.payment_link) return escapeHTML(details.payment_link);
+  return '—';
+}
+
+async function loadTrail() {
+  const wrap = document.getElementById('tableWrap');
+  try {
+    const res = await fetch(BACKEND + '/audit-trail?limit=50');
+    const data = await res.json();
+    if (!data.entries || !data.entries.length) {
+      wrap.innerHTML = '<div class="empty">No actions logged yet — try the chat or MCP flow.</div>';
+      return;
+    }
+    const rows = data.entries.map(e => `
+      <tr>
+        <td>${formatTime(e.timestamp)}</td>
+        <td>${actorBadge(e.actor)}</td>
+        <td>${escapeHTML(e.action)}</td>
+        <td class="amount">${e.amount_inr != null ? 'Rs.' + e.amount_inr : '—'}</td>
+        <td>${statusBadge(e.status)}</td>
+        <td class="details">${formatDetails(e.action, e.status, e.details)}</td>
+      </tr>`).join('');
+    wrap.innerHTML = `
+      <table>
+        <thead>
+          <tr><th>Time</th><th>Actor</th><th>Action</th><th>Amount</th><th>Status</th><th>Details</th></tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+  } catch (err) {
+    wrap.innerHTML = '<div class="error">Could not reach the backend at ' + BACKEND + '. Is it running?</div>';
+  }
+}
+
+loadTrail();
+setInterval(loadTrail, REFRESH_MS);
+</script>
+</body>
+</html>

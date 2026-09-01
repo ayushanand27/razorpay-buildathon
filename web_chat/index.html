@@ -23,9 +23,18 @@
   .product-info { font-size:13px; line-height:1.3; }
   .product-info .name { font-weight:600; }
   .out-of-stock { color:#c0392b; font-weight:600; }
+  .nav { display:flex; gap:20px; align-items:center; padding:14px 24px; background:#1f2430; color:#fff; font-family:-apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+  .nav a { color:#cfd3dc; text-decoration:none; font-size:14px; font-weight:500; }
+  .nav a.active { color:#fff; border-bottom:2px solid #6a5cff; padding-bottom:3px; }
+  .nav a:hover { color:#fff; }
 </style>
 </head>
 <body>
+<div class="nav">
+  <a href="catalog.html">Catalog</a>
+  <a href="index.html" class="active">Chat</a>
+  <a href="audit-dashboard.html">Audit Trail</a>
+</div>
 <div class="phone">
   <div class="header">Demo Merchant Store <small>simulated WhatsApp checkout — human buyer flow</small></div>
   <div id="log"></div>
