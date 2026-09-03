@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Merchant Chat — Human Buyer Demo</title>
 <style>
   body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; background:#e5ddd5; margin:0; }
@@ -76,8 +77,12 @@ function botHTML(html) {
 }
 
 async function api(path, opts) {
-  const res = await fetch(BACKEND + path, opts);
-  return res.json();
+  try {
+    const res = await fetch(BACKEND + path, opts);
+    return res.json();
+  } catch (err) {
+    return { detail: "Could not reach the backend at " + BACKEND };
+  }
 }
 
 // No real product photos in this demo -- colored placeholder thumbs keyed
@@ -95,6 +100,7 @@ function escapeHTML(s) {
 
 async function showCatalog() {
   const data = await api('/catalog');
+  if (data.detail) { bot(data.detail); return; }
   let html = "Here's what we have:<br>";
   data.products.forEach(p => {
     const thumb = CATEGORY_THUMB[p.category] || { color: '#999', icon: '🛒' };
@@ -122,6 +128,7 @@ async function addItem(sku) {
 
 async function showCart() {
   const data = await api('/cart/' + SESSION_ID);
+  if (data.detail) { bot(data.detail); return; }
   if (!data.cart.length) { bot("Your cart is empty."); return; }
   let txt = "Your cart:\n";
   data.cart.forEach(l => txt += `${l.name} x${l.qty} — Rs.${l.qty*l.price_inr}\n`);
@@ -156,10 +163,24 @@ async function send(preset) {
   if (text === 'fail demo') return doCheckout(true);
   if (text.startsWith('add ')) return addItem(text.split(' ')[1].trim());
 
+  // Not a full NLU pass -- just a friendlier nudge for the demo when
+  // someone types something buy-shaped instead of the exact command.
+  if (/\b(buy|purchase|get)\b/i.test(text)) {
+    bot("Looking to buy something? Type 'catalog' to browse, then 'add sku_001' (swap in the product id) to add it to your cart.");
+    return;
+  }
+
   bot("Try: 'catalog', 'add sku_001', 'cart', 'checkout', or 'fail demo'.");
 }
 
 bot("Hi! Welcome to Demo Merchant Store 👋\nType 'catalog' to see products.");
+
+// Clicking "Buy" on catalog.html links here as index.html?buy=sku_001
+// -- land straight in the purchase flow instead of an empty chat.
+const buySku = new URLSearchParams(window.location.search).get('buy');
+if (buySku) {
+  send('add ' + buySku);
+}
 </script>
 </body>
 </html>

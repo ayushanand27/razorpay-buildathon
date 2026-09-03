@@ -6,3 +6,4 @@ __pycache__/
 .DS_Store
 rzp-key.csv
 *.csv
+mcp_server/mcp_client_config.json

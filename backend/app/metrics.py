@@ -18,13 +18,30 @@ ACTORS = ("human_whatsapp", "ai_agent_mcp")
 def _query_scalar(sql: str, params: tuple = ()):
     conn = sqlite3.connect(audit.DB_PATH)
     try:
+        # Same schema as audit.py's _get_conn() -- /metrics can be the
+        # very first request against a brand-new audit_trail.db, before
+        # any log_action() call has created the table.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                actor TEXT NOT NULL,          -- 'human_whatsapp' | 'ai_agent_mcp'
+                actor_id TEXT,                -- phone number / mcp session id
+                action TEXT NOT NULL,         -- e.g. 'checkout_attempt', 'checkout_success'
+                amount_inr REAL,
+                status TEXT NOT NULL,         -- 'ok' | 'blocked' | 'failed' | 'retried'
+                details TEXT                  -- JSON blob, free-form
+            )
+            """
+        )
         return conn.execute(sql, params).fetchone()[0]
     finally:
         conn.close()
 
 
 def _revenue_inr(actor: str | None = None) -> float:
-    sql = "SELECT COALESCE(SUM(amount_inr), 0) FROM audit_log WHERE action = 'checkout_payment' AND status IN ('ok', 'retried')"
+    sql = "SELECT COALESCE(SUM(amount_inr), 0.0) FROM audit_log WHERE action = 'checkout_payment' AND status IN ('ok', 'retried')"
     params: tuple = ()
     if actor:
         sql += " AND actor = ?"

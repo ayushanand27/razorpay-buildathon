@@ -7,7 +7,7 @@ are taken directly from README.md; nothing here is new syntax.
 
 ```bash
 cd backend
-venv\Scripts\activate
+source venv/bin/activate   # Windows: venv\Scripts\activate
 uvicorn app.main:app --port 8123
 ```
 
@@ -34,15 +34,21 @@ Then, separately, to show the graceful-failure-and-retry path:
 fail demo
 ```
 
-## 3. The 4 guardrail / checkout scenarios (curl)
+## 3. The 6 guardrail / checkout scenarios (curl)
 
 Same requests as the human/AI buyer flows above, run directly against the
 API for a fast, narrated pass — useful if clicking through the chat UI is
 too slow for the video.
 
+Every scenario below views the cart (`GET /cart/{session_id}`) before
+checking out. That's not optional dressing — it's the "gated" guarantee
+from scenario (e): checkout is server-enforced to require a cart review
+first, for every scenario, not just the happy path.
+
 **a. Happy-path checkout (real Razorpay test-mode link)**
 ```bash
 curl -X POST http://127.0.0.1:8123/cart/add -H "Content-Type: application/json" -d "{\"session_id\":\"demo1\",\"actor\":\"human_whatsapp\",\"product_id\":\"sku_001\",\"qty\":1}"
+curl http://127.0.0.1:8123/cart/demo1
 curl -X POST http://127.0.0.1:8123/checkout -H "Content-Type: application/json" -d "{\"session_id\":\"demo1\",\"actor\":\"human_whatsapp\"}"
 ```
 Expect: a real `https://rzp.io/...` payment_link.
@@ -50,6 +56,7 @@ Expect: a real `https://rzp.io/...` payment_link.
 **b. Out-of-stock guardrail block**
 ```bash
 curl -X POST http://127.0.0.1:8123/cart/add -H "Content-Type: application/json" -d "{\"session_id\":\"demo2\",\"actor\":\"ai_agent_mcp\",\"product_id\":\"sku_005\",\"qty\":1}"
+curl http://127.0.0.1:8123/cart/demo2
 curl -X POST http://127.0.0.1:8123/checkout -H "Content-Type: application/json" -d "{\"session_id\":\"demo2\",\"actor\":\"ai_agent_mcp\"}"
 ```
 Expect: `403`, `blocked_by_guardrail: out_of_stock`.
@@ -57,6 +64,7 @@ Expect: `403`, `blocked_by_guardrail: out_of_stock`.
 **c. AI spending-cap guardrail block (cart total over ₹2,000)**
 ```bash
 curl -X POST http://127.0.0.1:8123/cart/add -H "Content-Type: application/json" -d "{\"session_id\":\"demo3\",\"actor\":\"ai_agent_mcp\",\"product_id\":\"sku_001\",\"qty\":2}"
+curl http://127.0.0.1:8123/cart/demo3
 curl -X POST http://127.0.0.1:8123/checkout -H "Content-Type: application/json" -d "{\"session_id\":\"demo3\",\"actor\":\"ai_agent_mcp\"}"
 ```
 Expect: `403`, `blocked_by_guardrail: amount_inr 2998 exceeds AI agent spending cap of 2000`.
@@ -64,9 +72,58 @@ Expect: `403`, `blocked_by_guardrail: amount_inr 2998 exceeds AI agent spending 
 **d. simulate_failure — graceful retry and recovery**
 ```bash
 curl -X POST http://127.0.0.1:8123/cart/add -H "Content-Type: application/json" -d "{\"session_id\":\"demo4\",\"actor\":\"human_whatsapp\",\"product_id\":\"sku_003\",\"qty\":1}"
+curl http://127.0.0.1:8123/cart/demo4
 curl -X POST http://127.0.0.1:8123/checkout -H "Content-Type: application/json" -d "{\"session_id\":\"demo4\",\"actor\":\"human_whatsapp\",\"simulate_failure\":true}"
 ```
 Expect: `200`, `note` field contains `recovered_after_retry`.
+
+**e. Gated guardrail block — checkout without reviewing the cart first**
+```bash
+curl -X POST http://127.0.0.1:8123/cart/add -H "Content-Type: application/json" -d "{\"session_id\":\"demo6\",\"actor\":\"human_whatsapp\",\"product_id\":\"sku_001\",\"qty\":1}"
+curl -X POST http://127.0.0.1:8123/checkout -H "Content-Type: application/json" -d "{\"session_id\":\"demo6\",\"actor\":\"human_whatsapp\"}"
+```
+Expect: `403`, `blocked_by_guardrail: cart_not_reviewed`. No `GET /cart/demo6`
+call happened for this session, so the server-side gate blocks it even
+though the cart itself is perfectly valid (in-stock, under any spending
+cap) — this is what makes "gated" a guarantee an agent can't route
+around by just passing `confirm=True`, not merely something the MCP
+tool's docstring asks nicely for.
+
+**f. Cumulative daily spending-cap block (3 AI-agent transactions, each under the per-transaction cap)**
+
+Three separate ₹1,848 purchases (sku_001 + sku_003) from the same AI
+agent, back to back. Each one individually clears the ₹2,000
+per-transaction cap (scenario c) — but the per-transaction cap alone
+doesn't stop the same agent running many separate under-the-cap
+purchases; the daily cap does.
+```bash
+# Transaction 1 -- Rs.1,848, well under the per-transaction cap
+curl -X POST http://127.0.0.1:8123/cart/add -H "Content-Type: application/json" -d "{\"session_id\":\"demo7\",\"actor\":\"ai_agent_mcp\",\"product_id\":\"sku_001\",\"qty\":1}"
+curl -X POST http://127.0.0.1:8123/cart/add -H "Content-Type: application/json" -d "{\"session_id\":\"demo7\",\"actor\":\"ai_agent_mcp\",\"product_id\":\"sku_003\",\"qty\":1}"
+curl http://127.0.0.1:8123/cart/demo7
+curl -X POST http://127.0.0.1:8123/checkout -H "Content-Type: application/json" -d "{\"session_id\":\"demo7\",\"actor\":\"ai_agent_mcp\"}"
+```
+Expect: `200`. Today's AI-agent total so far: ₹1,848.
+
+```bash
+# Transaction 2 -- another Rs.1,848, still under the per-transaction cap
+curl -X POST http://127.0.0.1:8123/cart/add -H "Content-Type: application/json" -d "{\"session_id\":\"demo8\",\"actor\":\"ai_agent_mcp\",\"product_id\":\"sku_001\",\"qty\":1}"
+curl -X POST http://127.0.0.1:8123/cart/add -H "Content-Type: application/json" -d "{\"session_id\":\"demo8\",\"actor\":\"ai_agent_mcp\",\"product_id\":\"sku_003\",\"qty\":1}"
+curl http://127.0.0.1:8123/cart/demo8
+curl -X POST http://127.0.0.1:8123/checkout -H "Content-Type: application/json" -d "{\"session_id\":\"demo8\",\"actor\":\"ai_agent_mcp\"}"
+```
+Expect: `200`. Today's AI-agent total so far: ₹3,696.
+
+```bash
+# Transaction 3 -- another Rs.1,848, still individually under the
+# per-transaction cap -- but 3,696 + 1,848 = 5,544 exceeds the
+# Rs.5,000 daily cap, so this one blocks.
+curl -X POST http://127.0.0.1:8123/cart/add -H "Content-Type: application/json" -d "{\"session_id\":\"demo9\",\"actor\":\"ai_agent_mcp\",\"product_id\":\"sku_001\",\"qty\":1}"
+curl -X POST http://127.0.0.1:8123/cart/add -H "Content-Type: application/json" -d "{\"session_id\":\"demo9\",\"actor\":\"ai_agent_mcp\",\"product_id\":\"sku_003\",\"qty\":1}"
+curl http://127.0.0.1:8123/cart/demo9
+curl -X POST http://127.0.0.1:8123/checkout -H "Content-Type: application/json" -d "{\"session_id\":\"demo9\",\"actor\":\"ai_agent_mcp\"}"
+```
+Expect: `403`, `blocked_by_guardrail: daily_spending_cap_exceeded`.
 
 ## 4. Audit trail — show every action logged
 
@@ -83,11 +140,14 @@ actor, amount, and status — nothing from either flow is missing.
 In a separate terminal (keep the backend from step 1 running):
 ```bash
 cd mcp_server
-venv\Scripts\activate
+source venv/bin/activate   # Windows: venv\Scripts\activate
+python generate_mcp_config.py
 ```
-Point your MCP client's config at `server.py` — use
-`mcp_client_config.example.json` as-is (paths are already filled in for
-this machine). Restart the client, then ask it:
+That writes `mcp_client_config.json` with the correct absolute paths
+for this machine — no hand-editing paths (see
+`mcp_client_config.example.json` if you want the raw format instead).
+Point your MCP client's config at the file it just wrote. Restart the
+client, then ask it:
 
 ```
 browse the demo merchant's catalog and buy me a water bottle

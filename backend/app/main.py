@@ -7,12 +7,12 @@ merchant is "transactable by an AI buyer end to end" using the exact
 same checkout logic a human uses, not a separate toy path.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from . import catalog, cart, payments, audit, metrics
-from .guardrails import check_checkout_allowed, GuardrailBlocked
+from . import catalog, cart, payments, audit, metrics, webhooks
+from .guardrails import check_checkout_allowed, check_cart_reviewed, GuardrailBlocked
 
 app = FastAPI(title="Agentic Commerce Demo Backend")
 
@@ -60,7 +60,7 @@ def add_to_cart(req: AddToCartRequest):
     audit.log_action(req.actor, req.session_id, "add_to_cart", "ok",
                       details={"product_id": req.product_id, "qty": req.qty})
     cart_product_ids = {li["product_id"] for li in updated_cart}
-    upsell = catalog.get_upsell(req.product_id, exclude_ids=cart_product_ids)
+    upsell = catalog.get_upsell(req.product_id, cart_items=updated_cart, exclude_ids=cart_product_ids)
     if upsell:
         cart.record_upsell_suggested(req.session_id, upsell["product_id"])
         audit.log_action(req.actor, req.session_id, "upsell_shown", "ok",
@@ -70,6 +70,7 @@ def add_to_cart(req: AddToCartRequest):
 
 @app.get("/cart/{session_id}")
 def view_cart(session_id: str):
+    cart.mark_cart_reviewed(session_id)
     return {"cart": cart.get_cart(session_id), "total_inr": cart.cart_total(session_id)}
 
 
@@ -87,38 +88,63 @@ def checkout(req: CheckoutRequest):
 
     total = cart.cart_total(req.session_id)
 
-    # ---- Guardrail check (bounded + gated) ----
     try:
-        # use the stock of the first out-of-stock item if any, else assume ok
-        min_stock = min(
-            (catalog.get_product(li["product_id"])["stock"] for li in line_items),
-            default=1,
+        # ---- Guardrail check (bounded + gated) ----
+        try:
+            # cart_not_reviewed checked first -- a workflow precondition,
+            # ahead of the stock/spending-cap checks below.
+            check_cart_reviewed(cart.was_cart_reviewed(req.session_id))
+            # use the stock of the first out-of-stock item if any, else assume ok
+            min_stock = min(
+                (catalog.get_product(li["product_id"])["stock"] for li in line_items),
+                default=1,
+            )
+            check_checkout_allowed(req.actor, total, min_stock)
+        except GuardrailBlocked as e:
+            audit.log_action(req.actor, req.session_id, "checkout_attempt", "blocked",
+                              amount_inr=total, details={"reason": e.reason})
+            raise HTTPException(403, f"blocked_by_guardrail: {e.reason}")
+
+        audit.log_action(req.actor, req.session_id, "checkout_attempt", "ok", amount_inr=total)
+
+        # ---- Payment (with graceful-failure demo path) ----
+        description = f"Order for {req.session_id} ({len(line_items)} item(s))"
+        result, note = payments.create_payment_link_with_retry(
+            total, description, req.customer_contact, simulate_failure=req.simulate_failure
         )
-        check_checkout_allowed(req.actor, total, min_stock)
-    except GuardrailBlocked as e:
-        audit.log_action(req.actor, req.session_id, "checkout_attempt", "blocked",
-                          amount_inr=total, details={"reason": e.reason})
-        raise HTTPException(403, f"blocked_by_guardrail: {e.reason}")
 
-    audit.log_action(req.actor, req.session_id, "checkout_attempt", "ok", amount_inr=total)
+        if result is None:
+            audit.log_action(req.actor, req.session_id, "checkout_payment", "failed",
+                              amount_inr=total, details={"reason": note})
+            raise HTTPException(502, f"payment_failed: {note}")
 
-    # ---- Payment (with graceful-failure demo path) ----
-    description = f"Order for {req.session_id} ({len(line_items)} item(s))"
-    result, note = payments.create_payment_link_with_retry(
-        total, description, req.customer_contact, simulate_failure=req.simulate_failure
-    )
+        status = "retried" if note and "recovered" in note else "ok"
+        audit.log_action(req.actor, req.session_id, "checkout_payment", status,
+                          amount_inr=total, details={"payment_link": result.get("short_url"),
+                                                      "payment_link_id": result.get("id"), "note": note})
 
-    if result is None:
-        audit.log_action(req.actor, req.session_id, "checkout_payment", "failed",
-                          amount_inr=total, details={"reason": note})
-        raise HTTPException(502, f"payment_failed: {note}")
+        cart.clear_cart(req.session_id)
+        return {"payment_link": result.get("short_url"), "amount_inr": total, "note": note}
+    finally:
+        # Whatever happened -- blocked, failed, or succeeded -- the next
+        # checkout attempt needs a fresh view_cart() call; the gate
+        # can't be reused across multiple attempts.
+        cart.clear_cart_reviewed(req.session_id)
 
-    status = "retried" if note and "recovered" in note else "ok"
-    audit.log_action(req.actor, req.session_id, "checkout_payment", status,
-                      amount_inr=total, details={"payment_link": result.get("short_url"), "note": note})
 
-    cart.clear_cart(req.session_id)
-    return {"payment_link": result.get("short_url"), "amount_inr": total, "note": note}
+@app.post("/webhook/razorpay")
+async def razorpay_webhook(request: Request):
+    """
+    Confirms a payment was actually *completed*, not just that a
+    payment link was created (payments.py / checkout()). Signature
+    verification happens before anything in the body is trusted.
+    """
+    body = await request.body()
+    signature = request.headers.get("X-Razorpay-Signature", "")
+    result = webhooks.handle_webhook(body, signature)
+    if not result["ok"]:
+        raise HTTPException(400, result["reason"])
+    return {"status": "ok"}
 
 
 @app.get("/audit-trail")

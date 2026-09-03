@@ -7,6 +7,8 @@ inventory system, exposed the same way to both the WhatsApp agent
 and the MCP tool layer so there is exactly one source of truth.
 """
 
+from . import upsell_copy
+
 CATALOG = [
     {
         "id": "sku_001",
@@ -67,8 +69,13 @@ def get_product(product_id: str):
 # Fixed "frequently bought together" lookup -- deterministic, not a model
 # call. The track's own AI Judgment bar ("use AI models appropriately,
 # prefer deterministic solutions where AI is unnecessary") is better
-# served by a plain table here than by spending an LLM call on it.
-# Never points at sku_005 (out of stock) as a suggestion target.
+# served by a plain table here than by spending an LLM call on *which*
+# SKU to suggest. Never points at sku_005 (out of stock) as a target.
+#
+# The reason TEXT below is only the fallback -- get_upsell() tries an
+# LLM-written, cart-tailored one-liner first (upsell_copy.py) and
+# falls back to this fixed string on any failure, so the demo never
+# depends on an external call succeeding.
 UPSELL_MAP = {
     "sku_001": ("sku_003", "Frequently bought with Wireless Earbuds Pro -- stay hydrated on the go."),
     "sku_002": ("sku_004", "Popular with students -- pair your tee with a fresh notebook set."),
@@ -78,16 +85,17 @@ UPSELL_MAP = {
 }
 
 
-def get_upsell(product_id: str, exclude_ids: set[str] | None = None):
+def get_upsell(product_id: str, cart_items: list[dict] | None = None, exclude_ids: set[str] | None = None):
     entry = UPSELL_MAP.get(product_id)
     if not entry:
         return None
-    suggested_id, reason = entry
+    suggested_id, static_reason = entry
     if exclude_ids and suggested_id in exclude_ids:
         return None
     product = get_product(suggested_id)
     if not product or product["stock"] == 0:
         return None
+    reason = upsell_copy.generate_reason(cart_items or [], product["name"], static_reason)
     return {
         "product_id": product["id"],
         "name": product["name"],

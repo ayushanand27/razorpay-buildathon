@@ -1,8 +1,9 @@
 {
+  "_comment": "Template only -- run `python generate_mcp_config.py` in this directory to write a mcp_client_config.json with the correct absolute paths for your machine, instead of hand-editing the placeholders below.",
   "mcpServers": {
     "demo-merchant": {
-      "command": "C:/Users/adity/Downloads/RAZORPAY/razorpay-agentic-commerce/mcp_server/venv/Scripts/python.exe",
-      "args": ["C:/Users/adity/Downloads/RAZORPAY/razorpay-agentic-commerce/mcp_server/server.py"],
+      "command": "/absolute/path/to/razorpay-agentic-commerce/mcp_server/venv/Scripts/python.exe",
+      "args": ["/absolute/path/to/razorpay-agentic-commerce/mcp_server/server.py"],
       "env": {
         "BACKEND_URL": "http://127.0.0.1:8123"
       }

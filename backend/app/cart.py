@@ -65,3 +65,23 @@ def check_and_record_upsell_acceptance(session_id: str, product_id: str) -> bool
 
 def get_upsell_accepted_count() -> int:
     return _upsell_accepted_count
+
+
+# "Gated" enforcement support: server-side proof the buyer's cart was
+# reviewed (via GET /cart/{session_id}, i.e. view_cart) before this
+# checkout attempt -- not just an MCP tool docstring convention. In
+# memory like _CARTS above; cleared after every checkout attempt (see
+# clear_cart_reviewed) so it can't be reused without a fresh review.
+_CART_REVIEWED: dict[str, bool] = {}
+
+
+def mark_cart_reviewed(session_id: str):
+    _CART_REVIEWED[session_id] = True
+
+
+def was_cart_reviewed(session_id: str) -> bool:
+    return _CART_REVIEWED.get(session_id, False)
+
+
+def clear_cart_reviewed(session_id: str):
+    _CART_REVIEWED[session_id] = False

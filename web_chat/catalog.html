@@ -2,6 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Demo Merchant — Catalog</title>
 <style>
   * { box-sizing: border-box; }
@@ -65,6 +66,15 @@
     padding: 12px 28px; border-radius: 999px; font-weight: 600; font-size: 14px;
   }
   .chat-btn:hover { background: #5a4ce0; }
+  .buy-btn {
+    display: block; text-align: center; text-decoration: none;
+    background: #6a5cff; color: #fff;
+    padding: 8px 12px; border-radius: 8px; font-weight: 600; font-size: 13px;
+  }
+  .buy-btn:hover { background: #5a4ce0; }
+  .buy-btn.disabled {
+    background: #f1efec; color: #8a8a92; cursor: not-allowed;
+  }
   .loading, .error { color: #8a8a92; font-size: 14px; padding: 40px 0; text-align: center; }
 </style>
 </head>
@@ -115,6 +125,9 @@ async function loadCatalog() {
     grid.innerHTML = data.products.map(p => {
       const thumb = CATEGORY_THUMB[p.category] || { color: '#999', icon: '🛒' };
       const oos = p.stock === 0;
+      const buyBtn = oos
+        ? `<span class="buy-btn disabled">Unavailable</span>`
+        : `<a class="buy-btn" href="index.html?buy=${encodeURIComponent(p.id)}">Buy</a>`;
       return `
         <div class="card ${oos ? 'oos' : ''}">
           <div class="thumb" style="background:${thumb.color}">${thumb.icon}</div>
@@ -124,6 +137,7 @@ async function loadCatalog() {
             <span class="price">Rs.${p.price_inr}</span>
             <span class="badge ${oos ? 'out-of-stock' : 'in-stock'}">${oos ? 'Out of stock' : 'In stock'}</span>
           </div>
+          ${buyBtn}
         </div>`;
     }).join('');
   } catch (err) {

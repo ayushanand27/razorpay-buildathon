@@ -30,7 +30,7 @@ Each word of that maps directly to a module:
 
 | Requirement | Where it lives |
 |---|---|
-| Explainable | `backend/app/audit.py` — every action, from any actor, is appended to an audit log with actor, amount, status, and reason |
+| Explainable | `backend/app/audit.py` — every action, from any actor, is appended to an audit log with actor, amount, status, and reason. Now covers actual payment confirmation, not just payment-link creation: `backend/app/webhooks.py` verifies Razorpay's `payment.captured` webhook signature and logs the confirmed payment separately from the link-creation step |
 | Bounded | `backend/app/guardrails.py` — AI-agent purchases are capped at ₹2,000/transaction; out-of-stock items are blocked before checkout even starts |
 | Gated | `mcp_server/server.py` — `checkout()` requires an explicit `confirm=True`, only after the agent has shown the buyer the cart total via `view_cart()` |
 | One failure, handled gracefully | `backend/app/payments.py` — `create_payment_link_with_retry()`; trigger it via `simulate_failure=True` on the checkout call, watch it fail once, auto-retry, recover, and log both the failure and the recovery |
@@ -90,11 +90,13 @@ readable, auto-refreshing view of the audit trail.
 cd mcp_server
 python3 -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
+python generate_mcp_config.py   # writes mcp_client_config.json with this machine's absolute paths -- no hand-editing
 ```
-Then point your MCP client's config at `server.py` — see
-`mcp_client_config.example.json` for the exact format. Restart
-the client, and ask it to "browse the demo merchant's catalog and
-buy me a water bottle" — it will call the tools live.
+Then point your MCP client's config at the `mcp_client_config.json`
+this writes (see `mcp_client_config.example.json` for the raw format
+if you'd rather wire it up by hand). Restart the client, and ask it to
+"browse the demo merchant's catalog and buy me a water bottle" — it
+will call the tools live.
 
 ### 4. Audit trail
 ```
