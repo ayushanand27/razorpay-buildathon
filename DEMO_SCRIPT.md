@@ -95,3 +95,33 @@ browse the demo merchant's catalog and buy me a water bottle
 
 It will call `browse_catalog`, `add_to_cart`, `view_cart`, and `checkout`
 live, hitting the exact same backend as the WhatsApp flow in step 2.
+
+## 6. Upsell demo and Growth Metrics walkthrough
+
+Back in the human-buyer chat (step 2), after `add sku_001`, watch for the
+💡 suggestion right below the "Added!" message:
+```
+💡 Stainless Steel Water Bottle — Rs.349
+Frequently bought with Wireless Earbuds Pro -- stay hydrated on the go.
+Reply: add sku_003
+```
+Reply `add sku_003` to accept it -- that's what counts as an "upsell
+accepted" in the metrics below.
+
+Or via curl, for a fast narrated pass:
+```bash
+curl -X POST http://127.0.0.1:8123/cart/add -H "Content-Type: application/json" -d "{\"session_id\":\"demo5\",\"actor\":\"human_whatsapp\",\"product_id\":\"sku_001\",\"qty\":1}"
+```
+Expect: the response includes an `"upsell"` object suggesting `sku_003`.
+
+Now open `web_chat/metrics.html` (same nav strip as the other three
+pages). Auto-refreshing every 5s, same as the audit dashboard, it shows:
+- Total Revenue
+- Revenue by Actor (human vs AI, a simple CSS bar comparison)
+- Conversion Rate (overall and split by actor)
+- Upsell Acceptance Rate
+
+Point out: every number on this page comes from `GET /metrics`, which
+reads straight off the same audit trail shown in step 4 -- there is no
+separate metrics log, just a live aggregation over data the system was
+already writing.

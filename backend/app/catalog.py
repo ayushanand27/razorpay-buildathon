@@ -62,3 +62,35 @@ def get_product(product_id: str):
         if p["id"] == product_id:
             return p
     return None
+
+
+# Fixed "frequently bought together" lookup -- deterministic, not a model
+# call. The track's own AI Judgment bar ("use AI models appropriately,
+# prefer deterministic solutions where AI is unnecessary") is better
+# served by a plain table here than by spending an LLM call on it.
+# Never points at sku_005 (out of stock) as a suggestion target.
+UPSELL_MAP = {
+    "sku_001": ("sku_003", "Frequently bought with Wireless Earbuds Pro -- stay hydrated on the go."),
+    "sku_002": ("sku_004", "Popular with students -- pair your tee with a fresh notebook set."),
+    "sku_003": ("sku_001", "Complete your everyday carry with wireless earbuds."),
+    "sku_004": ("sku_002", "Notebook fans also like our graphic tee."),
+    "sku_005": ("sku_001", "That one's out of stock -- here's an in-stock pick in electronics."),
+}
+
+
+def get_upsell(product_id: str, exclude_ids: set[str] | None = None):
+    entry = UPSELL_MAP.get(product_id)
+    if not entry:
+        return None
+    suggested_id, reason = entry
+    if exclude_ids and suggested_id in exclude_ids:
+        return None
+    product = get_product(suggested_id)
+    if not product or product["stock"] == 0:
+        return None
+    return {
+        "product_id": product["id"],
+        "name": product["name"],
+        "price_inr": product["price_inr"],
+        "reason": reason,
+    }

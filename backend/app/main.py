@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from . import catalog, cart, payments, audit
+from . import catalog, cart, payments, audit, metrics
 from .guardrails import check_checkout_allowed, GuardrailBlocked
 
 app = FastAPI(title="Agentic Commerce Demo Backend")
@@ -56,9 +56,16 @@ def add_to_cart(req: AddToCartRequest):
         audit.log_action(req.actor, req.session_id, "add_to_cart", "failed", details={"reason": err})
         raise HTTPException(400, err)
 
+    cart.check_and_record_upsell_acceptance(req.session_id, req.product_id)
     audit.log_action(req.actor, req.session_id, "add_to_cart", "ok",
                       details={"product_id": req.product_id, "qty": req.qty})
-    return {"cart": updated_cart, "total_inr": cart.cart_total(req.session_id)}
+    cart_product_ids = {li["product_id"] for li in updated_cart}
+    upsell = catalog.get_upsell(req.product_id, exclude_ids=cart_product_ids)
+    if upsell:
+        cart.record_upsell_suggested(req.session_id, upsell["product_id"])
+        audit.log_action(req.actor, req.session_id, "upsell_shown", "ok",
+                          details={"suggested_product_id": upsell["product_id"]})
+    return {"cart": updated_cart, "total_inr": cart.cart_total(req.session_id), "upsell": upsell}
 
 
 @app.get("/cart/{session_id}")
@@ -117,6 +124,11 @@ def checkout(req: CheckoutRequest):
 @app.get("/audit-trail")
 def audit_trail(limit: int = 50):
     return {"entries": audit.get_trail(limit)}
+
+
+@app.get("/metrics")
+def get_metrics():
+    return metrics.get_metrics()
 
 
 @app.get("/health")

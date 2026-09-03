@@ -34,6 +34,7 @@
   <a href="catalog.html">Catalog</a>
   <a href="index.html" class="active">Chat</a>
   <a href="audit-dashboard.html">Audit Trail</a>
+  <a href="metrics.html">Metrics</a>
 </div>
 <div class="phone">
   <div class="header">Demo Merchant Store <small>simulated WhatsApp checkout — human buyer flow</small></div>
@@ -113,6 +114,10 @@ async function addItem(sku) {
   });
   if (data.detail) { bot("Couldn't add that: " + data.detail); return; }
   bot(`Added! Cart total: Rs.${data.total_inr}`);
+  if (data.upsell) {
+    const u = data.upsell;
+    bot(`💡 ${u.name} — Rs.${u.price_inr}\n${u.reason}\nReply: add ${u.product_id}`);
+  }
 }
 
 async function showCart() {

@@ -39,3 +39,29 @@ def cart_total(session_id: str) -> float:
 
 def clear_cart(session_id: str):
     _CARTS[session_id] = []
+
+
+# Growth-metrics support: tracks which product_ids have been suggested
+# as an upsell for a session, so a later add of that same product can
+# be counted as an "accepted" upsell. In-memory like _CARTS above --
+# no new DB table, resets with the process just like the cart store.
+_SUGGESTED_UPSELLS: dict[str, set[str]] = {}
+_upsell_accepted_count = 0
+
+
+def record_upsell_suggested(session_id: str, product_id: str):
+    _SUGGESTED_UPSELLS.setdefault(session_id, set()).add(product_id)
+
+
+def check_and_record_upsell_acceptance(session_id: str, product_id: str) -> bool:
+    """If product_id was previously suggested as an upsell for this
+    session, counts this add as an accepted upsell and returns True."""
+    global _upsell_accepted_count
+    if product_id in _SUGGESTED_UPSELLS.get(session_id, ()):
+        _upsell_accepted_count += 1
+        return True
+    return False
+
+
+def get_upsell_accepted_count() -> int:
+    return _upsell_accepted_count

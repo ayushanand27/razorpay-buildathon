@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Demo Merchant — Growth Metrics</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    background: #faf9f7;
+    color: #26262b;
+    margin: 0;
+  }
+  .nav {
+    display: flex; gap: 20px; align-items: center;
+    padding: 14px 24px;
+    background: #1f2430;
+    color: #fff;
+  }
+  .nav a { color: #cfd3dc; text-decoration: none; font-size: 14px; font-weight: 500; }
+  .nav a.active { color: #fff; border-bottom: 2px solid #6a5cff; padding-bottom: 3px; }
+  .nav a:hover { color: #fff; }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 32px 24px 60px; }
+  .page-header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 20px; flex-wrap: wrap; gap: 8px; }
+  .page-header h1 { font-size: 24px; margin: 0 0 6px; }
+  .page-header p { margin: 0; color: #6b6b75; font-size: 14px; }
+  .live-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #1e7a34; margin-right: 6px; animation: pulse 1.5s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 18px; margin-bottom: 24px; }
+  .card {
+    background: #fff; border: 1px solid #ece9e4; border-radius: 12px;
+    padding: 18px 20px;
+  }
+  .card .label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; color: #8a8a92; margin-bottom: 8px; }
+  .card .value { font-size: 26px; font-weight: 700; color: #1f2430; font-variant-numeric: tabular-nums; }
+  .card .sub { font-size: 12px; color: #8a8a92; margin-top: 4px; }
+
+  .panel { background: #fff; border: 1px solid #ece9e4; border-radius: 12px; padding: 20px 22px; margin-bottom: 18px; }
+  .panel h2 { font-size: 14px; margin: 0 0 16px; color: #6b6b75; text-transform: uppercase; letter-spacing: .03em; }
+
+  .bar-row { margin-bottom: 14px; }
+  .bar-row:last-child { margin-bottom: 0; }
+  .bar-label { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 6px; }
+  .bar-label .amt { font-weight: 600; font-variant-numeric: tabular-nums; }
+  .bar-track { background: #f1efec; border-radius: 999px; height: 10px; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 999px; }
+  .bar-fill.human { background: #3346c4; }
+  .bar-fill.ai { background: #7a2fc4; }
+
+  .rate-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 14px; }
+  .rate-item { text-align: center; padding: 10px; }
+  .rate-item .rate-value { font-size: 20px; font-weight: 700; }
+  .rate-item .rate-label { font-size: 12px; color: #8a8a92; margin-top: 2px; }
+
+  .loading, .error { color: #8a8a92; font-size: 14px; padding: 40px 0; text-align: center; }
+</style>
+</head>
+<body>
+<div class="nav">
+  <a href="catalog.html">Catalog</a>
+  <a href="index.html">Chat</a>
+  <a href="audit-dashboard.html">Audit Trail</a>
+  <a href="metrics.html" class="active">Metrics</a>
+</div>
+
+<div class="wrap">
+  <div class="page-header">
+    <div>
+      <h1>Growth Metrics</h1>
+      <p><span class="live-dot"></span>Auto-refreshing every 5s — computed live from the audit trail, both buyer flows combined.</p>
+    </div>
+  </div>
+  <div id="content"><div class="loading">Loading…</div></div>
+</div>
+
+<script>
+const BACKEND = "http://127.0.0.1:8123";
+const REFRESH_MS = 5000;
+
+function inr(n) {
+  return 'Rs.' + Number(n || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+}
+
+function pct(n) {
+  return Number(n || 0).toFixed(1) + '%';
+}
+
+function render(data) {
+  const content = document.getElementById('content');
+
+  const human = data.revenue_by_actor.human_whatsapp || 0;
+  const ai = data.revenue_by_actor.ai_agent_mcp || 0;
+  const maxRevenue = Math.max(human, ai, 1);
+
+  content.innerHTML = `
+    <div class="cards">
+      <div class="card">
+        <div class="label">Total Revenue</div>
+        <div class="value">${inr(data.total_revenue_inr)}</div>
+        <div class="sub">checkout_payment, ok + retried</div>
+      </div>
+      <div class="card">
+        <div class="label">Conversion Rate</div>
+        <div class="value">${pct(data.checkout_conversion_rate.overall)}</div>
+        <div class="sub">payments / checkout attempts</div>
+      </div>
+      <div class="card">
+        <div class="label">Upsell Shown</div>
+        <div class="value">${data.upsell_shown_count}</div>
+        <div class="sub">add_to_cart events with a suggestion</div>
+      </div>
+      <div class="card">
+        <div class="label">Upsell Acceptance</div>
+        <div class="value">${pct(data.upsell_acceptance_rate)}</div>
+        <div class="sub">${data.upsell_accepted_count} of ${data.upsell_shown_count} accepted</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Revenue by Actor</h2>
+      <div class="bar-row">
+        <div class="bar-label"><span>Human (WhatsApp)</span><span class="amt">${inr(human)}</span></div>
+        <div class="bar-track"><div class="bar-fill human" style="width:${(human / maxRevenue * 100).toFixed(1)}%"></div></div>
+      </div>
+      <div class="bar-row">
+        <div class="bar-label"><span>AI Agent (MCP)</span><span class="amt">${inr(ai)}</span></div>
+        <div class="bar-track"><div class="bar-fill ai" style="width:${(ai / maxRevenue * 100).toFixed(1)}%"></div></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Conversion Rate by Actor</h2>
+      <div class="rate-grid">
+        <div class="rate-item">
+          <div class="rate-value">${pct(data.checkout_conversion_rate.overall)}</div>
+          <div class="rate-label">Overall</div>
+        </div>
+        <div class="rate-item">
+          <div class="rate-value">${pct(data.checkout_conversion_rate.by_actor.human_whatsapp)}</div>
+          <div class="rate-label">Human (WhatsApp)</div>
+        </div>
+        <div class="rate-item">
+          <div class="rate-value">${pct(data.checkout_conversion_rate.by_actor.ai_agent_mcp)}</div>
+          <div class="rate-label">AI Agent (MCP)</div>
+        </div>
+      </div>
+    </div>`;
+}
+
+async function loadMetrics() {
+  const content = document.getElementById('content');
+  try {
+    const res = await fetch(BACKEND + '/metrics');
+    const data = await res.json();
+    render(data);
+  } catch (err) {
+    content.innerHTML = '<div class="error">Could not reach the backend at ' + BACKEND + '. Is it running?</div>';
+  }
+}
+
+loadMetrics();
+setInterval(loadMetrics, REFRESH_MS);
+</script>
+</body>
+</html>

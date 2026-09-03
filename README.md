@@ -34,6 +34,7 @@ Each word of that maps directly to a module:
 | Bounded | `backend/app/guardrails.py` — AI-agent purchases are capped at ₹2,000/transaction; out-of-stock items are blocked before checkout even starts |
 | Gated | `mcp_server/server.py` — `checkout()` requires an explicit `confirm=True`, only after the agent has shown the buyer the cart total via `view_cart()` |
 | One failure, handled gracefully | `backend/app/payments.py` — `create_payment_link_with_retry()`; trigger it via `simulate_failure=True` on the checkout call, watch it fail once, auto-retry, recover, and log both the failure and the recovery |
+| AI Growth (quantified) | `backend/app/metrics.py` + `web_chat/metrics.html` — revenue, conversion rate, and upsell acceptance computed live from the audit trail |
 
 ## Architecture
 
