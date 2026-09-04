@@ -1,13 +1,17 @@
 """
-Concurrency safety -- proves the per-session lock in main.py actually
-prevents the idempotency race it's meant to close: two genuinely
-concurrent requests carrying the SAME (session_id, idempotency_key)
-must never create two orders, on either rail.
+Concurrency safety -- proves the database-level idempotency claim
+(orders.claim_idempotency_key(), a real PRIMARY KEY constraint --
+see db.py's IdempotencyRecord) actually prevents the race it's meant
+to close: two genuinely concurrent requests carrying the SAME
+(session_id, idempotency_key) must never create two orders, on either
+rail. This replaced an in-memory threading.Lock() dict that only ever
+protected a single process -- a PRIMARY KEY constraint SQLite enforces
+atomically holds even across separate worker processes.
 
 Fires real concurrent requests against the SAME TestClient/app instance
-from separate OS threads (a barrier makes both hit the lock at
-essentially the same moment) -- this exercises the actual lock, not
-just sequential calls that would pass even without one.
+from separate OS threads (a barrier makes both hit the claim at
+essentially the same moment) -- this exercises the actual database
+constraint, not just sequential calls that would pass even without one.
 """
 
 import threading
@@ -82,7 +86,7 @@ def test_concurrent_checkout_same_idempotency_key_creates_only_one_order(client)
     assert all(r.status_code == 200 for r in responses)
     assert responses[0].json() == responses[1].json()
 
-    entries = client.get("/audit-trail").json()["entries"]
+    entries = client.get("/audit-trail", params={"session_id": session_id}).json()["entries"]
     payment_entries = [e for e in entries if e["action"] == "checkout_payment"]
     assert len(payment_entries) == 1, "concurrent duplicate requests must produce exactly one order"
 
@@ -103,12 +107,13 @@ def test_concurrent_agent_pay_same_idempotency_key_creates_only_one_order(client
     assert all(r.status_code == 200 for r in responses)
     assert responses[0].json() == responses[1].json()
 
-    entries = client.get("/audit-trail").json()["entries"]
+    entries = client.get("/audit-trail", params={"session_id": session_id}).json()["entries"]
     payment_entries = [e for e in entries if e["action"] == "checkout_payment"]
     assert len(payment_entries) == 1
 
     # Stock decremented exactly once, not twice -- proves capture_order's
-    # own lock also holds even if two callers somehow both reached it.
+    # own atomic conditional UPDATE (status='created' -> 'capturing')
+    # also holds even if two callers somehow both reached it.
     assert catalog.get_product("demo_merchant", "sku_003")["stock"] == starting_stock - 1
 
 

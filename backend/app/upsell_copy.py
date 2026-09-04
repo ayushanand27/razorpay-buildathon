@@ -1,7 +1,7 @@
 """
 Optional dynamic upsell copy.
 
-Each merchant's own upsell_map (merchants.py) still deterministically
+Each merchant's own upsell_map (db.py's UpsellMapEntry table) still deterministically
 decides WHICH product gets suggested -- that's a "which SKU" decision
 an LLM call would be overkill for. This module only tries to write the
 one-line *reason* text tailored to what's actually in the cart, in

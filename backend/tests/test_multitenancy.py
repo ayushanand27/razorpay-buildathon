@@ -9,7 +9,7 @@ across the boundary.
 import time
 import uuid
 
-from app import merchants, sessions
+from app import merchant_registry, sessions
 
 FIT_SUPPLY = "fit_supply_co"
 DEMO = "demo_merchant"
@@ -27,7 +27,7 @@ def sign_and_mint_agent_session(client, merchant_id, per_tx_cap_inr=5000, daily_
         "expires_at": time.time() + 3600,
         "nonce": nonce or uuid.uuid4().hex,
     }
-    sig = sessions.sign_warrant(warrant, secret=secret or merchants.get_warrant_secret(merchant_id))
+    sig = sessions.sign_warrant(warrant, secret=secret or merchant_registry.get_warrant_secret(merchant_id))
     return client.post(f"/merchants/{merchant_id}/session/agent", json={"warrant": warrant, "signature": sig})
 
 
@@ -61,7 +61,7 @@ def test_unknown_merchant_catalog_404s(client):
 
 
 def test_two_merchants_reusing_the_same_sku_id_never_collide(client):
-    """merchants.py deliberately gives demo_merchant and fit_supply_co
+    """db.py's seed data deliberately gives demo_merchant and fit_supply_co
     both a "sku_001" -- completely different products. Fetching each
     merchant's catalog must show ITS OWN sku_001, never the other's."""
     demo_products = {p["id"]: p for p in client.get(f"/merchants/{DEMO}/catalog").json()["products"]}
@@ -123,7 +123,7 @@ def test_warrant_genuinely_signed_for_one_merchant_cannot_mint_a_session_at_anot
         "allowed_categories": ["equipment"], "expires_at": time.time() + 3600,
         "nonce": uuid.uuid4().hex,
     }
-    sig = sessions.sign_warrant(warrant, secret=merchants.get_warrant_secret(FIT_SUPPLY))
+    sig = sessions.sign_warrant(warrant, secret=merchant_registry.get_warrant_secret(FIT_SUPPLY))
 
     resp = client.post(f"/merchants/{DEMO}/session/agent", json={"warrant": warrant, "signature": sig})
     assert resp.status_code == 401
@@ -143,7 +143,7 @@ def test_warrant_with_mismatched_internal_merchant_id_is_rejected(client):
         "allowed_categories": ["electronics"], "expires_at": time.time() + 3600,
         "nonce": uuid.uuid4().hex,
     }
-    sig = sessions.sign_warrant(warrant, secret=merchants.get_warrant_secret(DEMO))  # but signed with demo's secret
+    sig = sessions.sign_warrant(warrant, secret=merchant_registry.get_warrant_secret(DEMO))  # but signed with demo's secret
 
     resp = client.post(f"/merchants/{DEMO}/session/agent", json={"warrant": warrant, "signature": sig})
     assert resp.status_code == 401
@@ -161,7 +161,7 @@ def test_warrant_signed_with_wrong_merchants_secret_fails_signature_check(client
         "allowed_categories": ["electronics"], "expires_at": time.time() + 3600,
         "nonce": uuid.uuid4().hex,
     }
-    wrong_secret_sig = sessions.sign_warrant(warrant, secret=merchants.get_warrant_secret(FIT_SUPPLY))
+    wrong_secret_sig = sessions.sign_warrant(warrant, secret=merchant_registry.get_warrant_secret(FIT_SUPPLY))
 
     resp = client.post(f"/merchants/{DEMO}/session/agent", json={"warrant": warrant, "signature": wrong_secret_sig})
     assert resp.status_code == 401
@@ -254,7 +254,7 @@ def test_stock_decrement_at_one_merchant_does_not_touch_the_others_sku(client):
     from app import webhooks
     import json as json_module
     payment_link_id = None
-    for entry in client.get("/audit-trail").json()["entries"]:
+    for entry in client.get("/audit-trail", params={"session_id": session_id}).json()["entries"]:
         if entry["action"] == "checkout_payment":
             payment_link_id = json_module.loads(entry["details"])["payment_link_id"]
             break

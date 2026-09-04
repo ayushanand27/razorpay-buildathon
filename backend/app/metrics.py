@@ -7,86 +7,55 @@ orders_created_inr for the "link created but not yet (or never) paid"
 number, so the dashboard can show the gap between the two instead of
 conflating them.
 
-Every number here is a read over data the rest of the system was
-already writing for the "explainable" requirement (audit.py's SQLite
-trail), plus one small counter in cart.py's SQLite store for upsell
-acceptance. No new tables, no schema migration.
+Every number here is a read over db.AuditLog (the same single app.db
+everything else uses), plus one small counter in cart.py's
+upsell_acceptances table. merchant_id is a real column on AuditLog now,
+so scoping is a direct WHERE filter -- no more resolving each row's
+actor_id back to a session to find its merchant.
 
-Merchant-scoped: pass merchant_id to get_metrics() to see just ONE
-merchant's numbers (GET /merchants/{merchant_id}/metrics), or omit it
-for the global, all-merchants total (GET /metrics, unchanged default
-behavior). audit_log has no merchant_id column of its own -- rather
-than a schema migration, each row's actor_id (always a session_id,
-see audit.log_action()'s call sites) is resolved back to its merchant
-via sessions.get_session() and filtered in Python, the same approach
-audit.captured_spend_today() already uses for the daily cap.
+merchant_id=None here means "aggregate across every merchant" -- an
+intentional platform-wide total (GET /metrics), distinct from the
+audit trail itself: this endpoint only ever returns aggregated counts
+and sums, never the underlying per-tenant rows, so it doesn't reopen
+the raw cross-tenant data leak that GET /audit-trail was purged of
+(see audit.py). GET /merchants/{merchant_id}/metrics passes a real
+merchant_id for one merchant's own numbers.
 """
 
 import json
-import sqlite3
 
-from . import audit, cart
+from sqlmodel import select
+
+from . import cart, db
 
 ACTORS = ("human_whatsapp", "ai_agent_mcp")
 
 
-def _rows(action: str, statuses: tuple[str, ...], actor: str | None = None) -> list[tuple]:
+def _rows(action: str, statuses: tuple[str, ...], actor: str | None = None,
+          merchant_id: str | None = None) -> list[tuple]:
     """Returns (actor_id, amount_inr, details) rows matching action/statuses
-    (and actor, if given) -- the raw material every aggregate below is
-    computed from, so merchant filtering only has to happen in one place."""
-    conn = sqlite3.connect(audit.DB_PATH)
-    try:
-        # Same schema as audit.py's _get_conn() -- /metrics can be the
-        # very first request against a brand-new audit_trail.db, before
-        # any log_action() call has created the table.
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp REAL NOT NULL,
-                actor TEXT NOT NULL,          -- 'human_whatsapp' | 'ai_agent_mcp'
-                actor_id TEXT,                -- phone number / mcp session id
-                action TEXT NOT NULL,         -- e.g. 'checkout_attempt', 'checkout_success'
-                amount_inr REAL,
-                status TEXT NOT NULL,         -- 'ok' | 'blocked' | 'failed' | 'retried'
-                details TEXT                  -- JSON blob, free-form
-            )
-            """
+    (and actor/merchant_id, if given) -- the raw material every
+    aggregate below is computed from."""
+    with db.get_session() as s:
+        query = select(db.AuditLog.actor_id, db.AuditLog.amount_inr, db.AuditLog.details).where(
+            db.AuditLog.action == action, db.AuditLog.status.in_(statuses)
         )
-        placeholders = ",".join("?" * len(statuses))
-        sql = f"SELECT actor_id, amount_inr, details FROM audit_log WHERE action = ? AND status IN ({placeholders})"
-        params = [action, *statuses]
         if actor:
-            sql += " AND actor = ?"
-            params.append(actor)
-        return conn.execute(sql, tuple(params)).fetchall()
-    finally:
-        conn.close()
-
-
-def _filter_by_merchant(rows: list[tuple], merchant_id: str | None) -> list[tuple]:
-    if merchant_id is None:
-        return rows
-    from . import sessions  # local import -- avoids a circular import at module load time
-
-    filtered = []
-    for row in rows:
-        session_id = row[0]
-        session = sessions.get_session(session_id)
-        if session and session.get("merchant_id") == merchant_id:
-            filtered.append(row)
-    return filtered
+            query = query.where(db.AuditLog.actor == actor)
+        if merchant_id is not None:
+            query = query.where(db.AuditLog.merchant_id == merchant_id)
+        return s.exec(query).all()
 
 
 def _sum_amount(action: str, statuses: tuple[str, ...], actor: str | None = None,
                  merchant_id: str | None = None) -> float:
-    rows = _filter_by_merchant(_rows(action, statuses, actor), merchant_id)
+    rows = _rows(action, statuses, actor, merchant_id)
     return sum(r[1] or 0.0 for r in rows)
 
 
 def _count(action: str, statuses: tuple[str, ...], actor: str | None = None,
            merchant_id: str | None = None) -> int:
-    return len(_filter_by_merchant(_rows(action, statuses, actor), merchant_id))
+    return len(_rows(action, statuses, actor, merchant_id))
 
 
 def _captured_inr(actor: str | None = None, merchant_id: str | None = None) -> float:
@@ -117,7 +86,7 @@ def _upsell_blocked_by_cap_count(merchant_id: str | None = None) -> int:
     would_exceed_cap -- the other two blocked reasons (oos,
     already_in_cart) aren't spending-cap events, so they're excluded
     from this specific counter."""
-    rows = _filter_by_merchant(_rows("upsell_blocked", ("blocked",)), merchant_id)
+    rows = _rows("upsell_blocked", ("blocked",), merchant_id=merchant_id)
     count = 0
     for (_actor_id, _amount, details_json) in rows:
         try:

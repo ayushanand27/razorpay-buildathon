@@ -4,7 +4,8 @@ stock and counts as captured revenue (see orders.py / metrics.py). A
 payment link or order existing (payments.py / checkout() / agent_pay())
 is NOT proof money moved; this module is what makes that final
 "explainable" step real, by verifying an HMAC-SHA256 signature over
-the raw request body before trusting anything in it.
+the raw request body, then a freshness check on the event's own
+`created_at`, before trusting anything else in it.
 
 There is exactly ONE verification+capture code path -- handle_webhook()
 below -- used by BOTH:
@@ -23,12 +24,26 @@ Unlike the Razorpay API keys (which default to blank -> mock mode),
 RAZORPAY_WEBHOOK_SECRET is REQUIRED, matching AGENT_WARRANT_SECRET --
 there is no "skip verification" fallback for either signed action in
 this system.
+
+Replay defense is two layers, matching what a real signed webhook
+actually gives you:
+  1. `created_at` freshness -- an HMAC signature alone never expires,
+     so a captured (valid signature, valid body) webhook replayed
+     minutes/hours/days later is rejected outright as stale, before
+     it ever reaches order-matching logic.
+  2. Even a replay inside the freshness window is a no-op, not a
+     double-capture -- capture_order() is a one-way created->captured
+     state transition (see orders.py); a webhook for an
+     already-captured order is logged as `replayed`, not `paid`, so it
+     can never inflate metrics.py's revenue totals or re-decrement
+     stock, no matter how many times the same event is delivered.
 """
 
 import hashlib
 import hmac
 import json
 import os
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -40,6 +55,13 @@ from . import audit, orders as orders_mod
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "")
+
+# Razorpay's own webhook docs recommend validating recency; 5 minutes
+# is a generous window for real network/processing delay while still
+# rejecting a captured-and-replayed-later event. A small negative
+# tolerance also catches an event claiming to be from the future.
+WEBHOOK_MAX_AGE_SECONDS = int(os.environ.get("WEBHOOK_MAX_AGE_SECONDS", "300"))
+WEBHOOK_CLOCK_SKEW_SECONDS = 60
 
 
 def sign_body(body_bytes: bytes, secret: str | None = None) -> str:
@@ -71,15 +93,30 @@ def _verify_signature(body: bytes, signature: str, secret: str) -> bool:
 
 def _capture_and_log(order: dict, source: str, payment_id: str | None = None) -> tuple[bool, str | None]:
     ok, reason = orders_mod.capture_order(order["order_id"], payment_id=payment_id)
+
+    if ok and reason == "already_captured":
+        # A duplicate delivery of a webhook we already fully processed
+        # -- log it as `replayed`, NOT `paid`, so metrics.py's revenue
+        # sum (which totals every `paid` row) can never double-count a
+        # single real payment just because Razorpay (or an attacker who
+        # captured the request off the wire) sent the same event twice.
+        audit.log_action(order["actor"], order["session_id"], "payment_confirmed", "replayed",
+                          merchant_id=order["merchant_id"], amount_inr=order["total_inr"],
+                          details={"payment_link_id": order["payment_link_id"],
+                                   "razorpay_order_id": order["razorpay_order_id"],
+                                   "source": source, "order_id": order["order_id"],
+                                   "reason": "duplicate_webhook_delivery"})
+        return True, reason
+
     if ok:
         audit.log_action(order["actor"], order["session_id"], "payment_confirmed", "paid",
-                          amount_inr=order["total_inr"],
+                          merchant_id=order["merchant_id"], amount_inr=order["total_inr"],
                           details={"payment_link_id": order["payment_link_id"],
                                    "razorpay_order_id": order["razorpay_order_id"],
                                    "source": source, "order_id": order["order_id"]})
     else:
         audit.log_action(order["actor"], order["session_id"], "payment_confirmed", "capture_failed",
-                          amount_inr=order["total_inr"],
+                          merchant_id=order["merchant_id"], amount_inr=order["total_inr"],
                           details={"payment_link_id": order["payment_link_id"],
                                    "razorpay_order_id": order["razorpay_order_id"],
                                    "source": source, "reason": reason, "order_id": order["order_id"]})
@@ -87,10 +124,11 @@ def _capture_and_log(order: dict, source: str, payment_id: str | None = None) ->
 
 
 def handle_webhook(body: bytes, signature: str, source: str = "webhook") -> dict:
-    """Returns {"ok": True} on a verified event, or {"ok": False,
-    "reason": ...} on an invalid/unverifiable one. Matches an order by
-    payment_link_id (human/Payment-Links rail) or by the payment's
-    order_id (agent/Orders rail) -- whichever the payload carries."""
+    """Returns {"ok": True} on a verified, fresh event, or {"ok": False,
+    "reason": ...} on an invalid/unverifiable/stale one. Matches an
+    order by payment_link_id (human/Payment-Links rail) or by the
+    payment's order_id (agent/Orders rail) -- whichever the payload
+    carries."""
     if not RAZORPAY_WEBHOOK_SECRET:
         return {"ok": False, "reason": "razorpay_webhook_secret_not_configured"}
 
@@ -105,6 +143,19 @@ def handle_webhook(body: bytes, signature: str, source: str = "webhook") -> dict
         audit.log_action("razorpay_webhook", "unknown", "webhook_received", "invalid_signature",
                           details={"reason": "unparseable_body", "source": source})
         return {"ok": False, "reason": "invalid_payload"}
+
+    created_at = payload.get("created_at")
+    if not isinstance(created_at, (int, float)):
+        audit.log_action("razorpay_webhook", "unknown", "webhook_received", "expired_timestamp",
+                          details={"reason": "missing_or_invalid_created_at", "source": source})
+        return {"ok": False, "reason": "missing_or_invalid_timestamp"}
+
+    age = time.time() - created_at
+    if age > WEBHOOK_MAX_AGE_SECONDS or age < -WEBHOOK_CLOCK_SKEW_SECONDS:
+        audit.log_action("razorpay_webhook", "unknown", "webhook_received", "expired_timestamp",
+                          details={"reason": "stale_or_future_timestamp", "created_at": created_at,
+                                   "age_seconds": age, "source": source})
+        return {"ok": False, "reason": "expired_timestamp"}
 
     event = payload.get("event", "")
     payment_entity = payload.get("payload", {}).get("payment", {}).get("entity", {})
@@ -136,14 +187,17 @@ def handle_webhook(body: bytes, signature: str, source: str = "webhook") -> dict
 
 def build_capture_payload(*, payment_link_id: str | None = None, razorpay_order_id: str | None = None,
                            amount_inr: float = 0) -> dict:
-    """Builds a payment.captured event body shaped like a real Razorpay
-    webhook payload, for either rail -- used by /demo/simulate-capture
-    callers (tests, DEMO_SCRIPT, and POST /agent/pay's self-completion)
-    so the exact same handle_webhook() parsing above applies to both a
-    real webhook and this demo stand-in."""
+    """Builds a payment.captured event shaped like a REAL Razorpay
+    webhook payload (top-level entity/account_id/event/contains/
+    created_at, plus the nested payload.payment.entity block) -- used
+    by /demo/simulate-capture callers (tests, DEMO_SCRIPT, and POST
+    /agent/pay's self-completion) so the exact same handle_webhook()
+    parsing above, including the created_at freshness check, applies
+    identically to both a real webhook and this demo stand-in."""
     payment_entity = {
         "id": f"pay_DEMO{os.urandom(5).hex()}",
         "amount": int(amount_inr * 100),
+        "currency": "INR",
         "status": "captured",
     }
     if razorpay_order_id:
@@ -153,4 +207,11 @@ def build_capture_payload(*, payment_link_id: str | None = None, razorpay_order_
     if payment_link_id:
         payload["payment_link"] = {"entity": {"id": payment_link_id}}
 
-    return {"event": "payment.captured", "payload": payload}
+    return {
+        "entity": "event",
+        "account_id": "acc_DEMO0000000000",
+        "event": "payment.captured",
+        "contains": ["payment"],
+        "payload": payload,
+        "created_at": int(time.time()),
+    }

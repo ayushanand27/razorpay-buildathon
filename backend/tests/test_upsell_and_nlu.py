@@ -76,7 +76,7 @@ def test_get_upsell_blocks_would_exceed_cap():
 
 
 def test_get_upsell_blocks_oos_target():
-    catalog.get_product("demo_merchant", "sku_003")["stock"] = 0
+    catalog.set_stock_for_tests("demo_merchant", "sku_003", 0)
     upsell, blocked = catalog.get_upsell("demo_merchant", "sku_001", cart_items=[], exclude_ids=set())
     assert upsell is None
     assert blocked == {"product_id": "sku_003", "reason": "oos"}
@@ -112,7 +112,7 @@ def test_upsell_blocked_by_cap_logged_and_counted(client):
     assert resp.status_code == 200
     assert resp.json()["upsell"] is None
 
-    entries = client.get("/audit-trail").json()["entries"]
+    entries = client.get("/audit-trail", params={"session_id": session_id}).json()["entries"]
     blocked_entry = next(e for e in entries if e["action"] == "upsell_blocked")
     assert blocked_entry["status"] == "blocked"
     details = json.loads(blocked_entry["details"])
@@ -143,7 +143,7 @@ def test_upsell_blocked_by_human_max_order(client):
     assert resp.status_code == 200
     assert resp.json()["upsell"] is None
 
-    entries = client.get("/audit-trail").json()["entries"]
+    entries = client.get("/audit-trail", params={"session_id": session_id}).json()["entries"]
     blocked_entry = next(e for e in entries if e["action"] == "upsell_blocked")
     assert json.loads(blocked_entry["details"])["reason"] == "would_exceed_cap"
 
@@ -256,7 +256,7 @@ def test_nlu_turn_add_plan_shows_real_upsell(client, monkeypatch):
     assert body["tool"] == "add"
     assert body["data"][0]["upsell"]["product_id"] == "sku_003"
     # Went through the real add_to_cart() -- audit trail proves it.
-    entries = client.get("/audit-trail").json()["entries"]
+    entries = client.get("/audit-trail", params={"session_id": session_id}).json()["entries"]
     assert any(e["action"] == "add_to_cart" and e["status"] == "ok" for e in entries)
 
 
@@ -391,12 +391,17 @@ def test_cart_remove_clears_review_flag(client):
 # orders count too, not just captured ones
 # ---------------------------------------------------------------------
 
-def test_pending_spend_today_counts_orders_stuck_mid_flight():
+def test_pending_spend_today_counts_orders_stuck_mid_flight(client):
     from app import orders as orders_module
+
+    # A real BuyerSession row must exist first -- orders.session_id is a
+    # genuine foreign key now (db.py), not a free-form string the way
+    # the old orders.db was.
+    stuck_session_id = agent_session_id(client)
 
     order_id = orders_module.new_order_id()
     orders_module.create_order(
-        order_id, "demo_merchant", "some_session", "ai_agent_mcp",
+        order_id, "demo_merchant", stuck_session_id, "ai_agent_mcp",
         [{"product_id": "sku_001", "qty": 1, "price_inr": 1499}],
         1499.0, "idem-key-1", {"order_id": order_id}, razorpay_order_id="order_stuck_mid_flight",
     )
@@ -410,6 +415,11 @@ def test_stuck_order_counts_toward_daily_cap_at_next_pay_attempt(client):
     from app import orders as orders_module
 
     session_id = agent_session_id(client, per_tx_cap_inr=2000, daily_cap_inr=1600)
+    # A second, otherwise-unrelated real session -- orders.session_id is
+    # a genuine foreign key now, so the "stuck" order needs a real
+    # BuyerSession row to point at, even though its own pay attempt
+    # never happens in this test.
+    stuck_session_id = agent_session_id(client, per_tx_cap_inr=2000, daily_cap_inr=1600)
 
     # Simulate an order from earlier today that got stuck in "created"
     # (e.g. a process crash right after order-creation, before
@@ -417,7 +427,7 @@ def test_stuck_order_counts_toward_daily_cap_at_next_pay_attempt(client):
     # though it was never captured.
     stuck_id = orders_module.new_order_id()
     orders_module.create_order(
-        stuck_id, "demo_merchant", "some_other_session", "ai_agent_mcp",
+        stuck_id, "demo_merchant", stuck_session_id, "ai_agent_mcp",
         [{"product_id": "sku_001", "qty": 1, "price_inr": 1499}],
         1499.0, "stuck-idem-key", {"order_id": stuck_id}, razorpay_order_id="order_stuck",
     )

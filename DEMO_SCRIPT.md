@@ -232,10 +232,14 @@ runs this exact sequence in under a second -- point to that instead.)
 
 ## 5. Audit trail — show every action logged
 
+The audit trail strictly requires a valid session now, and only ever
+returns THAT session's own merchant's rows — there's no global or
+unauthenticated view (point this out as the multi-tenant data-leak fix):
+
 ```bash
-curl http://127.0.0.1:8123/audit-trail
+curl "http://127.0.0.1:8123/audit-trail?session_id=$AGENT_SESSION"
 ```
-Or open in a browser: `http://127.0.0.1:8123/audit-trail`
+Or open in a browser: `http://127.0.0.1:8123/audit-trail?session_id=$AGENT_SESSION`
 
 Point out: every action above appears with actor, amount, and status
 -- nothing from either rail is missing. `policy_decision` entries (new)
@@ -339,14 +343,14 @@ cd backend
 python -c "
 import time, uuid, requests
 from app.sessions import sign_warrant
-from app import merchants
+from app import merchant_registry
 warrant = {
     'agent_id': 'fit_demo_agent', 'merchant_id': 'fit_supply_co',
     'per_tx_cap_inr': 8000, 'daily_cap_inr': 10000,
     'allowed_categories': ['equipment', 'supplements'],
     'expires_at': time.time() + 3600, 'nonce': uuid.uuid4().hex,
 }
-sig = sign_warrant(warrant, secret=merchants.get_warrant_secret('fit_supply_co'))
+sig = sign_warrant(warrant, secret=merchant_registry.get_warrant_secret('fit_supply_co'))
 resp = requests.post('http://127.0.0.1:8123/merchants/fit_supply_co/session/agent',
                       json={'warrant': warrant, 'signature': sig})
 print(resp.json())

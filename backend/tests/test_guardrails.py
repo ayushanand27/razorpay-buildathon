@@ -85,8 +85,8 @@ def capture_human_order(client, payment_link_id, amount_inr):
                         headers={"X-Razorpay-Signature": signature, "Content-Type": "application/json"})
 
 
-def last_checkout_payment_details(client):
-    entries = client.get("/audit-trail").json()["entries"]
+def last_checkout_payment_details(client, session_id):
+    entries = client.get("/audit-trail", params={"session_id": session_id}).json()["entries"]
     entry = next(e for e in entries if e["action"] == "checkout_payment")
     return json.loads(entry["details"])
 
@@ -109,7 +109,7 @@ def test_human_happy_path_checkout_and_capture(client):
     assert metrics["captured_inr"] == 0.0
     assert metrics["orders_created_inr"] == 1499.0
 
-    payment_link_id = last_checkout_payment_details(client)["payment_link_id"]
+    payment_link_id = last_checkout_payment_details(client, session_id)["payment_link_id"]
     cap_resp = capture_human_order(client, payment_link_id, 1499)
     assert cap_resp.status_code == 200
 
@@ -128,7 +128,7 @@ def test_human_simulate_failure_recovers_with_real_400_shape(client):
     assert resp.status_code == 200
     assert "recovered_after_retry" in resp.json()["note"]
 
-    details = last_checkout_payment_details(client)
+    details = last_checkout_payment_details(client, session_id)
     assert details["first_attempt_response"]["error"]["code"] == "BAD_REQUEST_ERROR"
     assert details["retry_attempt_response"] is not None
 
@@ -342,7 +342,7 @@ def test_pay_without_confirm_blocks_and_creates_no_order(client):
     assert resp.status_code == 400
 
     # No order, no policy decision, no payment attempt of any kind.
-    entries = client.get("/audit-trail").json()["entries"]
+    entries = client.get("/audit-trail", params={"session_id": session_id}).json()["entries"]
     assert not any(e["action"] in ("policy_decision", "checkout_payment") for e in entries)
 
 
@@ -422,7 +422,8 @@ def test_double_submit_same_idempotency_key_returns_original_order_human(client)
     assert second.status_code == 200
     assert second.json() == first_body
 
-    payment_entries = [e for e in client.get("/audit-trail").json()["entries"] if e["action"] == "checkout_payment"]
+    payment_entries = [e for e in client.get("/audit-trail", params={"session_id": session_id}).json()["entries"]
+                        if e["action"] == "checkout_payment"]
     assert len(payment_entries) == 1
 
 
@@ -439,7 +440,8 @@ def test_double_submit_same_idempotency_key_returns_original_order_agent(client)
     assert second.status_code == 200
     assert second.json() == first_body
 
-    payment_entries = [e for e in client.get("/audit-trail").json()["entries"] if e["action"] == "checkout_payment"]
+    payment_entries = [e for e in client.get("/audit-trail", params={"session_id": session_id}).json()["entries"]
+                        if e["action"] == "checkout_payment"]
     assert len(payment_entries) == 1
 
     # Only ONE capture -- stock decremented exactly once.
@@ -486,7 +488,7 @@ def test_stock_not_decremented_until_capture(client):
 
     assert catalog.get_product("demo_merchant", "sku_001")["stock"] == starting_stock  # unchanged -- not yet captured
 
-    payment_link_id = last_checkout_payment_details(client)["payment_link_id"]
+    payment_link_id = last_checkout_payment_details(client, session_id)["payment_link_id"]
     capture_human_order(client, payment_link_id, 1499)
 
     assert catalog.get_product("demo_merchant", "sku_001")["stock"] == starting_stock - 1  # decremented only now
@@ -504,16 +506,14 @@ def test_capture_failure_restores_stock(client):
     resp = client.post("/checkout", json={"session_id": session_id, "idempotency_key": new_idempotency_key()})
     assert resp.status_code == 200
 
-    payment_link_id = last_checkout_payment_details(client)["payment_link_id"]
+    payment_link_id = last_checkout_payment_details(client, session_id)["payment_link_id"]
 
-    product = catalog.get_product("demo_merchant", "sku_004")
-    stock_before_capture_attempt = 2
-    product["stock"] = stock_before_capture_attempt
+    catalog.set_stock_for_tests("demo_merchant", "sku_004", 2)
 
     cap_resp = capture_human_order(client, payment_link_id, 249 * 5)
     assert cap_resp.status_code == 200
 
-    entries = client.get("/audit-trail").json()["entries"]
+    entries = client.get("/audit-trail", params={"session_id": session_id}).json()["entries"]
     confirmed = next(e for e in entries if e["action"] == "payment_confirmed")
     assert confirmed["status"] == "capture_failed"
     assert "insufficient_stock" in json.loads(confirmed["details"])["reason"]

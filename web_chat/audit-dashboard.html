@@ -65,6 +65,21 @@
 const BACKEND = "http://127.0.0.1:8123";
 const REFRESH_MS = 5000;
 
+// GET /audit-trail now strictly requires a valid session and only ever
+// returns THAT session's own merchant's rows -- there is no
+// unauthenticated/global read path left on the backend. This
+// dashboard mints one lightweight human session once, on load, purely
+// to view demo_merchant's own trail (it's never used to buy anything).
+let sessionIdPromise = null;
+async function getSessionId() {
+  if (!sessionIdPromise) {
+    sessionIdPromise = fetch(BACKEND + '/session/human', { method: 'POST' })
+      .then(res => res.json())
+      .then(data => data.session_id);
+  }
+  return sessionIdPromise;
+}
+
 function escapeHTML(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
@@ -97,7 +112,8 @@ function formatDetails(action, status, detailsRaw) {
 async function loadTrail() {
   const wrap = document.getElementById('tableWrap');
   try {
-    const res = await fetch(BACKEND + '/audit-trail?limit=50');
+    const sessionId = await getSessionId();
+    const res = await fetch(BACKEND + '/audit-trail?limit=50&session_id=' + encodeURIComponent(sessionId));
     const data = await res.json();
     if (!data.entries || !data.entries.length) {
       wrap.innerHTML = '<div class="empty">No actions logged yet — try the chat or MCP flow.</div>';

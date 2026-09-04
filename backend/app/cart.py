@@ -1,7 +1,12 @@
 """
-Cart store, keyed by session id -- persisted in SQLite (carts.db,
-alongside audit_trail.db) rather than an in-memory dict, so a backend
-restart doesn't silently empty every buyer's in-progress cart.
+Cart store, keyed by session id -- backed by db.py's shared SQLModel
+database, not an in-memory dict, so a backend restart doesn't silently
+empty every buyer's in-progress cart.
+
+Every row carries merchant_id directly (not just derivable via a join
+through session_id), so a query can filter on merchant_id alone
+without a join, and the tenant boundary is explicit even if a future
+caller queries these tables directly.
 
 Both the WhatsApp flow and the MCP flow call into this same module, so
 there is one cart implementation, not two -- avoids the classic demo
@@ -9,70 +14,19 @@ bug of the "AI buyer" and "human buyer" secretly running on different
 logic.
 """
 
-import os
-import sqlite3
 import time
 
-from . import catalog
+from sqlmodel import select
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "carts.db")
-
-
-def _get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA busy_timeout = 5000")
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS cart_items (
-            session_id TEXT NOT NULL,
-            product_id TEXT NOT NULL,
-            name TEXT NOT NULL,
-            qty INTEGER NOT NULL,
-            price_inr REAL NOT NULL,
-            PRIMARY KEY (session_id, product_id)
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS cart_reviewed (
-            session_id TEXT PRIMARY KEY,
-            reviewed INTEGER NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS suggested_upsells (
-            session_id TEXT NOT NULL,
-            product_id TEXT NOT NULL,
-            PRIMARY KEY (session_id, product_id)
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS upsell_acceptances (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            session_id TEXT NOT NULL,
-            product_id TEXT NOT NULL,
-            created_at REAL NOT NULL
-        )
-        """
-    )
-    return conn
+from . import catalog, db
 
 
 def get_cart(session_id: str) -> list[dict]:
-    conn = _get_conn()
-    try:
-        rows = conn.execute(
-            "SELECT product_id, name, qty, price_inr FROM cart_items WHERE session_id = ? ORDER BY rowid",
-            (session_id,),
-        ).fetchall()
-    finally:
-        conn.close()
-    return [{"product_id": r[0], "name": r[1], "qty": r[2], "price_inr": r[3]} for r in rows]
+    with db.get_session() as s:
+        rows = s.exec(
+            select(db.CartItem).where(db.CartItem.session_id == session_id)
+        ).all()
+    return [{"product_id": r.product_id, "name": r.name, "qty": r.qty, "price_inr": r.price_inr} for r in rows]
 
 
 def add_to_cart(merchant_id: str, session_id: str, product_id: str, qty: int = 1):
@@ -80,31 +34,20 @@ def add_to_cart(merchant_id: str, session_id: str, product_id: str, qty: int = 1
     if not product:
         return None, "product_not_found"
 
-    conn = _get_conn()
-    try:
-        existing = conn.execute(
-            "SELECT qty FROM cart_items WHERE session_id = ? AND product_id = ?",
-            (session_id, product_id),
-        ).fetchone()
+    with db.get_session() as s:
+        existing = s.get(db.CartItem, (session_id, product_id))
         if existing:
-            conn.execute(
-                "UPDATE cart_items SET qty = qty + ? WHERE session_id = ? AND product_id = ?",
-                (qty, session_id, product_id),
-            )
+            existing.qty += qty
+            s.add(existing)
         else:
-            conn.execute(
-                "INSERT INTO cart_items (session_id, product_id, name, qty, price_inr) VALUES (?, ?, ?, ?, ?)",
-                (session_id, product_id, product["name"], qty, product["price_inr"]),
-            )
-        conn.commit()
-    finally:
-        conn.close()
+            s.add(db.CartItem(session_id=session_id, product_id=product_id, merchant_id=merchant_id,
+                               name=product["name"], qty=qty, price_inr=product["price_inr"]))
 
     # Any mutation invalidates a prior review -- "cart_reviewed since
     # last mutation" (policy.py rule 7) means exactly that: adding
     # another item after a GET /cart/{session_id} review, without
     # reviewing again, must NOT still count as reviewed.
-    clear_cart_reviewed(session_id)
+    clear_cart_reviewed(session_id, merchant_id)
     return get_cart(session_id), None
 
 
@@ -114,21 +57,15 @@ def remove_from_cart(session_id: str, product_id: str):
     on success, (cart, "product_not_in_cart") if there was nothing to
     remove -- the caller decides whether that's an error worth
     surfacing."""
-    conn = _get_conn()
-    try:
-        cur = conn.execute(
-            "DELETE FROM cart_items WHERE session_id = ? AND product_id = ?",
-            (session_id, product_id),
-        )
-        conn.commit()
-        removed = cur.rowcount > 0
-    finally:
-        conn.close()
+    with db.get_session() as s:
+        existing = s.get(db.CartItem, (session_id, product_id))
+        if not existing:
+            return get_cart(session_id), "product_not_in_cart"
+        merchant_id = existing.merchant_id
+        s.delete(existing)
 
-    if removed:
-        clear_cart_reviewed(session_id)  # a removal is a mutation too
-        return get_cart(session_id), None
-    return get_cart(session_id), "product_not_in_cart"
+    clear_cart_reviewed(session_id, merchant_id)  # a removal is a mutation too
+    return get_cart(session_id), None
 
 
 def set_line_item_price_for_tests(session_id: str, product_id: str, price_inr: float):
@@ -137,15 +74,11 @@ def set_line_item_price_for_tests(session_id: str, product_id: str, price_inr: f
     test can simulate a tampered/corrupted cart entry to prove
     policy.py's price-tamper check (which recomputes from the live
     server catalog, ignoring this value) actually works."""
-    conn = _get_conn()
-    try:
-        conn.execute(
-            "UPDATE cart_items SET price_inr = ? WHERE session_id = ? AND product_id = ?",
-            (price_inr, session_id, product_id),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    with db.get_session() as s:
+        item = s.get(db.CartItem, (session_id, product_id))
+        if item:
+            item.price_inr = price_inr
+            s.add(item)
 
 
 def cart_total(session_id: str) -> float:
@@ -154,99 +87,60 @@ def cart_total(session_id: str) -> float:
 
 
 def clear_cart(session_id: str):
-    conn = _get_conn()
-    try:
-        conn.execute("DELETE FROM cart_items WHERE session_id = ?", (session_id,))
-        conn.commit()
-    finally:
-        conn.close()
+    with db.get_session() as s:
+        rows = s.exec(select(db.CartItem).where(db.CartItem.session_id == session_id)).all()
+        for row in rows:
+            s.delete(row)
 
 
-def record_upsell_suggested(session_id: str, product_id: str):
-    conn = _get_conn()
-    try:
-        conn.execute(
-            "INSERT OR IGNORE INTO suggested_upsells (session_id, product_id) VALUES (?, ?)",
-            (session_id, product_id),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+def record_upsell_suggested(session_id: str, merchant_id: str, product_id: str):
+    with db.get_session() as s:
+        existing = s.get(db.SuggestedUpsell, (session_id, product_id))
+        if not existing:
+            s.add(db.SuggestedUpsell(session_id=session_id, product_id=product_id, merchant_id=merchant_id))
 
 
-def check_and_record_upsell_acceptance(session_id: str, product_id: str) -> bool:
+def check_and_record_upsell_acceptance(session_id: str, merchant_id: str, product_id: str) -> bool:
     """If product_id was previously suggested as an upsell for this
     session, counts this add as an accepted upsell and returns True."""
-    conn = _get_conn()
-    try:
-        was_suggested = conn.execute(
-            "SELECT 1 FROM suggested_upsells WHERE session_id = ? AND product_id = ?",
-            (session_id, product_id),
-        ).fetchone()
+    with db.get_session() as s:
+        was_suggested = s.get(db.SuggestedUpsell, (session_id, product_id))
         if was_suggested:
-            conn.execute(
-                "INSERT INTO upsell_acceptances (session_id, product_id, created_at) VALUES (?, ?, ?)",
-                (session_id, product_id, time.time()),
-            )
-            conn.commit()
+            s.add(db.UpsellAcceptance(session_id=session_id, merchant_id=merchant_id,
+                                       product_id=product_id, created_at=time.time()))
             return True
         return False
-    finally:
-        conn.close()
 
 
 def get_upsell_accepted_count(merchant_id: str | None = None) -> int:
-    """carts.db has no merchant_id column of its own -- when scoping to
-    one merchant, each acceptance's session_id is resolved back to its
-    merchant via sessions.get_session() and filtered, the same
-    cross-store approach audit.captured_spend_today() and metrics.py
-    already use."""
-    conn = _get_conn()
-    try:
-        if merchant_id is None:
-            return conn.execute("SELECT COUNT(*) FROM upsell_acceptances").fetchone()[0]
-        session_ids = [r[0] for r in conn.execute("SELECT session_id FROM upsell_acceptances").fetchall()]
-    finally:
-        conn.close()
-
-    from . import sessions  # local import -- avoids a circular import at module load time
-
-    return sum(
-        1 for session_id in session_ids
-        if (session := sessions.get_session(session_id)) and session.get("merchant_id") == merchant_id
-    )
+    with db.get_session() as s:
+        query = select(db.UpsellAcceptance)
+        if merchant_id is not None:
+            query = query.where(db.UpsellAcceptance.merchant_id == merchant_id)
+        return len(s.exec(query).all())
 
 
-def mark_cart_reviewed(session_id: str):
-    conn = _get_conn()
-    try:
-        conn.execute(
-            "INSERT INTO cart_reviewed (session_id, reviewed) VALUES (?, 1) "
-            "ON CONFLICT(session_id) DO UPDATE SET reviewed = 1",
-            (session_id,),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+def mark_cart_reviewed(session_id: str, merchant_id: str):
+    with db.get_session() as s:
+        row = s.get(db.CartReviewed, session_id)
+        if row:
+            row.reviewed = True
+            s.add(row)
+        else:
+            s.add(db.CartReviewed(session_id=session_id, merchant_id=merchant_id, reviewed=True))
 
 
 def was_cart_reviewed(session_id: str) -> bool:
-    conn = _get_conn()
-    try:
-        row = conn.execute("SELECT reviewed FROM cart_reviewed WHERE session_id = ?", (session_id,)).fetchone()
-    finally:
-        conn.close()
-    return bool(row and row[0])
+    with db.get_session() as s:
+        row = s.get(db.CartReviewed, session_id)
+        return bool(row and row.reviewed)
 
 
-def clear_cart_reviewed(session_id: str):
-    conn = _get_conn()
-    try:
-        conn.execute(
-            "INSERT INTO cart_reviewed (session_id, reviewed) VALUES (?, 0) "
-            "ON CONFLICT(session_id) DO UPDATE SET reviewed = 0",
-            (session_id,),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+def clear_cart_reviewed(session_id: str, merchant_id: str):
+    with db.get_session() as s:
+        row = s.get(db.CartReviewed, session_id)
+        if row:
+            row.reviewed = False
+            s.add(row)
+        else:
+            s.add(db.CartReviewed(session_id=session_id, merchant_id=merchant_id, reviewed=False))

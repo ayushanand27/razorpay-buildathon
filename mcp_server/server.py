@@ -206,12 +206,15 @@ def pay(confirm: bool, idempotency_key: str, session_id: str | None = None) -> d
 
 
 @mcp.tool()
-def get_audit_trail(limit: int = 10) -> dict:
-    """View recent audit log entries -- every action any actor (human or
-    AI) has taken, for transparency."""
-    resp = requests.get(f"{BACKEND_URL}/audit-trail", params={"limit": limit}, timeout=10)
+def get_audit_trail(limit: int = 10, session_id: str | None = None) -> dict:
+    """View recent audit log entries -- every action this buyer's own
+    merchant has logged (human or AI actor), for transparency. The
+    backend strictly scopes this to the caller's own session's
+    merchant -- there is no unauthenticated or cross-merchant view."""
+    sid = _resolve_session(session_id)
+    resp = requests.get(f"{BACKEND_URL}/audit-trail", params={"limit": limit, "session_id": sid}, timeout=10)
     resp.raise_for_status()
-    return resp.json()
+    return {**resp.json(), "session_id": sid}
 
 
 if __name__ == "__main__":

@@ -6,11 +6,18 @@ ever imported (each app module's load_dotenv() call does not override
 an already-set os.environ value, so setting these first pins them for
 the whole test session regardless of what the real .env contains).
 
-Every test gets a fresh, empty SQLite file for each persisted store
-(audit trail, sessions, carts, orders -- see each module's own
-DB_PATH) plus fresh catalog stock, via the autouse `_isolated_state`
-fixture -- tests never leak state into each other or into the real
-demo process's own database files.
+Every test gets a fresh, empty SQLite file for the ENTIRE shared
+database (app.db's merchants/sessions/carts/orders/audit_log tables
+all live together now -- see db.py) via the autouse `_isolated_state`
+fixture below, seeded with the two demo merchants fresh each time --
+tests never leak state into each other or into the real demo
+process's own app.db.
+
+A plain `create_engine()` binds its connection string once and for
+good, so the OLD pattern of monkeypatching each module's DB_PATH
+string no longer isolates anything for SQLAlchemy -- db.build_engine()
+exists specifically so a test can swap in a genuinely fresh, isolated
+engine (see db.py's docstring on why).
 """
 
 import os
@@ -36,7 +43,7 @@ for _i in range(2, 10):
 import pytest
 from fastapi.testclient import TestClient
 
-from app import audit, cart, catalog, orders, sessions
+from app import db
 from app.main import app
 
 
@@ -47,11 +54,7 @@ def client():
 
 @pytest.fixture(autouse=True)
 def _isolated_state(tmp_path, monkeypatch):
-    monkeypatch.setattr(audit, "DB_PATH", str(tmp_path / "audit_trail_test.db"))
-    monkeypatch.setattr(sessions, "DB_PATH", str(tmp_path / "sessions_test.db"))
-    monkeypatch.setattr(cart, "DB_PATH", str(tmp_path / "carts_test.db"))
-    monkeypatch.setattr(orders, "DB_PATH", str(tmp_path / "orders_test.db"))
-
-    catalog.reset_stock_for_tests()
-
+    monkeypatch.setattr(db, "_engine", db.build_engine(str(tmp_path / "app_test.db")))
+    db.create_db_and_tables()
+    db.seed_default_merchants()
     yield

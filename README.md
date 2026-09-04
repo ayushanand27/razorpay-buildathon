@@ -278,7 +278,9 @@ visible, not hidden.
 
 ## Multi-tenancy
 
-Two merchants ship out of the box (`backend/app/merchants.py`):
+Two merchants ship out of the box, seeded as real rows in the shared
+database (`backend/app/db.py`'s `seed_default_merchants()`, run once
+at startup):
 `demo_merchant` (the original storefront) and `fit_supply_co` (a
 second, unrelated one — gym equipment and supplements) — proving the
 tenant boundary is real, not just a config flag with one merchant
@@ -287,7 +289,12 @@ behind it. Their catalogs deliberately reuse the SAME SKU ids
 Set" at the other) to demonstrate that every lookup is scoped by
 `(merchant_id, product_id)` together — see `catalog.py`.
 
-- `GET /merchants` lists every registered merchant.
+- `GET /merchants` lists every registered merchant. `POST /merchants`
+  provisions a NEW one at runtime — no source edit, no PR, no
+  redeploy: pass `merchant_id`, `name`, `max_order_inr`, and
+  (optionally) `warrant_secret`; if omitted, a secret is generated
+  server-side and returned once, the only time it's shown in the
+  clear (`merchant_registry.py`).
 - `GET /merchants/{merchant_id}/catalog`, `POST
   /merchants/{merchant_id}/session/human`, `POST
   /merchants/{merchant_id}/session/agent` are the merchant-scoped
@@ -295,13 +302,14 @@ Set" at the other) to demonstrate that every lookup is scoped by
   `/session/agent` routes still work, as aliases for
   `merchant_id=demo_merchant` — the web chat and MCP server need no
   changes and keep working exactly as before.
-- **Each merchant has its own warrant secret**
-  (`AGENT_WARRANT_SECRET` for `demo_merchant`,
-  `FIT_SUPPLY_WARRANT_SECRET` for `fit_supply_co`, both REQUIRED, same
-  no-blank-fallback rule as before). A warrant genuinely signed for one
-  merchant fails signature verification if presented to a different
-  merchant's session endpoint — an attacker holding one merchant's
-  secret can't mint a session, or spend against a cap, at another.
+- **Each merchant has its own warrant secret**, stored on its own
+  `Merchant` row (`AGENT_WARRANT_SECRET` seeds `demo_merchant`'s,
+  `FIT_SUPPLY_WARRANT_SECRET` seeds `fit_supply_co`'s; a merchant
+  created later via `POST /merchants` supplies its own directly, no
+  env var involved). A warrant genuinely signed for one merchant fails
+  signature verification if presented to a different merchant's
+  session endpoint — an attacker holding one merchant's secret can't
+  mint a session, or spend against a cap, at another.
 - **The daily spending cap is isolated per (agent, merchant)**, not
   just per agent — `audit.captured_spend_today()` and
   `orders.pending_spend_today()` both take `merchant_id` and only sum
@@ -313,37 +321,73 @@ Set" at the other) to demonstrate that every lookup is scoped by
   `sku_001`.
 - A session is bound to exactly one merchant for its entire lifetime;
   every cart/checkout/pay call resolves `merchant_id` from the session,
-  never from the request body.
+  never from the request body. `merchant_id` is a real column on every
+  cart/order/audit-log row too, not just resolved via a session join.
+- **The audit trail is merchant-scoped ONLY — there is no global or
+  unauthenticated read path.** `GET /merchants/{merchant_id}/audit-trail`
+  (and the backward-compatible `GET /audit-trail?session_id=...` alias)
+  strictly require a valid session, and that session's own
+  `merchant_id` is the only one it can ever see — a session from one
+  merchant gets a `403` reading another's trail, on both routes
+  (`backend/tests/test_multitenancy.py`,
+  `backend/tests/test_webhook_security.py`).
 
-Adding a third merchant is just appending an entry to
-`merchants.MERCHANTS` and setting its warrant secret in `.env` —
-nothing else in the codebase hardcodes `demo_merchant` outside the
-backward-compatible aliases above.
+Adding a third merchant is a single `POST /merchants` call at
+runtime — nothing else in the codebase hardcodes `demo_merchant`
+outside the backward-compatible aliases above.
 
 **Metrics are merchant-scoped too**: `GET
 /merchants/{merchant_id}/metrics` (or `GET /metrics?merchant_id=...`)
 returns just that merchant's own revenue, conversion rate, and upsell
 numbers; the plain `GET /metrics` (no param) still returns the global
-total across every merchant combined, unchanged default behavior.
-`audit_log` has no `merchant_id` column of its own — rather than a
-schema migration, each row's `actor_id` (always a `session_id`) is
-resolved back to its merchant via `sessions.get_session()` and
-filtered, the same approach `audit.captured_spend_today()` already
-uses for the daily cap. `web_chat/metrics.html` requests
-`merchant_id=demo_merchant` explicitly, so that dashboard shows just
-that storefront's numbers, not `fit_supply_co`'s activity mixed in.
+total across every merchant combined, unchanged default behavior —
+`merchant_id` being a real `audit_log` column now, this is a direct
+`WHERE` filter, not a per-row session lookup. Unlike the audit trail,
+`/metrics` only ever returns aggregated counts/sums, never raw
+per-tenant rows, so a global view here doesn't reopen the cross-tenant
+leak the audit trail was locked down against. `web_chat/metrics.html`
+requests `merchant_id=demo_merchant` explicitly, so that dashboard
+shows just that storefront's numbers, not `fit_supply_co`'s activity
+mixed in.
 
 ## Persistence
 
-Sessions, carts, and orders are SQLite-backed (`sessions.db`,
-`carts.db`, `orders.db`, alongside `audit_trail.db` — all in
-`backend/app/`, all gitignored), not in-memory dicts — a backend
-restart (a redeploy, a crash) no longer silently logs out every buyer
-mid-session or drops an in-progress cart/order. Only the product
-catalog itself stays in-memory (`catalog.py`) — that's fixed demo data
-with no per-buyer state to lose. Each pytest test still gets a fully
-isolated, empty set of these files (see `backend/tests/conftest.py`),
-so tests never see real or cross-test data.
+Sessions, carts, orders, the merchant registry, and the audit log all
+live in ONE shared SQLite database (`backend/app/app.db`, gitignored),
+via SQLAlchemy/SQLModel — not four separate files, and not in-memory
+dicts. This matters for more than tidiness: SQLite guarantees ACID
+within one connection/transaction, never across separate files, so
+splitting state across files made a cross-table atomic write
+impossible. Now, an order and its audit-trail entry are written inside
+the SAME `with db.get_session() as s:` block (`main.py`'s `/checkout`
+and `/agent/pay`) — they commit together or roll back together; a
+crash between the two writes can no longer leave one without the
+other.
+
+A backend restart (a redeploy, a crash) no longer silently logs out
+every buyer mid-session, drops an in-progress cart/order, or resets
+stock to its seed values — all of that is a real database row now.
+Only the product catalog's *starting* values are seed data (`db.py`'s
+`seed_default_merchants()`, inserted once, only if a merchant doesn't
+already exist); stock decremented at capture time persists like any
+other write. Each pytest test still gets a fully isolated, empty
+database (a fresh engine built via `db.build_engine()`, swapped in by
+`backend/tests/conftest.py`), so tests never see real or cross-test
+data.
+
+**Idempotency is a database-level guarantee, not an in-memory lock.**
+`orders.claim_idempotency_key()` atomically reserves
+`(session_id, idempotency_key)` via a real `PRIMARY KEY` constraint
+(`IdempotencyRecord` in `db.py`) that SQLite enforces even across
+separate worker processes — a `threading.Lock()` dict (this codebase
+used to have one, in `main.py`) only ever protects one process, and
+silently does nothing under a multi-worker deployment. The same
+pattern replaces the old capture/refund lock too: `orders.py`'s
+`capture_order()`/`refund_order()` claim their status transition via a
+conditional `UPDATE ... WHERE status = '<expected>'` — SQLite
+serializes all writes to one database file globally, so a
+WHERE-guarded UPDATE with a `rowcount == 1` check is a real
+cross-process claim.
 
 ## Connecting a real Razorpay webhook (optional)
 

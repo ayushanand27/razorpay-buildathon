@@ -16,7 +16,7 @@ from . import catalog
 
 # Fallback/default ceiling on a single human order, used only if a
 # merchant somehow isn't found in the registry (shouldn't happen in
-# practice -- every real caller resolves merchants.get_max_order_inr()
+# practice -- every real caller resolves merchant_registry.get_max_order_inr()
 # for the specific merchant the session belongs to instead). Used only
 # by catalog.get_upsell() to avoid suggesting an add-on that would push
 # a human buyer's cart past a sane order size; NOT enforced at checkout
