@@ -91,6 +91,22 @@ def _verify_signature(body: bytes, signature: str, secret: str) -> bool:
         return False
 
 
+def _dig(payload, *keys: str) -> dict:
+    """Safely walks a chain of nested dict keys and always returns a
+    dict, never raises. `.get(k, {})` alone still crashes the moment an
+    INTERMEDIATE key is present but explicitly `null`/wrong-typed
+    (e.g. a real `{"payload": {"payment": null}}` for some other event
+    shape) -- the default only kicks in when the key is MISSING, not
+    when it's present with a non-dict value. A production payload
+    drifting in shape (a new/changed event type, a field Razorpay omits
+    for a particular payment method) must degrade to an empty dict
+    here, never a 500."""
+    current = payload
+    for key in keys:
+        current = current.get(key) if isinstance(current, dict) else None
+    return current if isinstance(current, dict) else {}
+
+
 def _capture_and_log(order: dict, source: str, payment_id: str | None = None) -> tuple[bool, str | None]:
     ok, reason = orders_mod.capture_order(order["order_id"], payment_id=payment_id)
 
@@ -144,6 +160,14 @@ def handle_webhook(body: bytes, signature: str, source: str = "webhook") -> dict
                           details={"reason": "unparseable_body", "source": source})
         return {"ok": False, "reason": "invalid_payload"}
 
+    if not isinstance(payload, dict):
+        # Valid JSON (a bare array, string, or number, say) but not the
+        # object shape a webhook event always is -- same "not actually
+        # a webhook" bucket as unparseable JSON, not a crash.
+        audit.log_action("razorpay_webhook", "unknown", "webhook_received", "invalid_signature",
+                          details={"reason": "payload_not_a_json_object", "source": source})
+        return {"ok": False, "reason": "invalid_payload"}
+
     created_at = payload.get("created_at")
     if not isinstance(created_at, (int, float)):
         audit.log_action("razorpay_webhook", "unknown", "webhook_received", "expired_timestamp",
@@ -157,15 +181,25 @@ def handle_webhook(body: bytes, signature: str, source: str = "webhook") -> dict
                                    "age_seconds": age, "source": source})
         return {"ok": False, "reason": "expired_timestamp"}
 
-    event = payload.get("event", "")
-    payment_entity = payload.get("payload", {}).get("payment", {}).get("entity", {})
+    event = payload.get("event") or ""
+    payment_entity = _dig(payload, "payload", "payment", "entity")
     audit.log_action("razorpay_webhook", payment_entity.get("id", "unknown"), "webhook_received",
                       "verified", details={"event": event, "source": source})
 
-    if event == "payment.captured":
-        payment_link_id = (
-            payload.get("payload", {}).get("payment_link", {}).get("entity", {}).get("id")
-        )
+    if event in ("payment.captured", "payment_link.paid"):
+        # Real Razorpay behavior, confirmed against a live webhook: a
+        # plain `payment.captured` event's payload only ever carries
+        # `payload.payment.entity` -- there is NO `payment_link` block
+        # in it, even for a payment that originated from a Payment
+        # Link. The `payment_link` block (and its `id`, matching what
+        # we stored as payment_link_id at checkout time) only appears
+        # in the separate `payment_link.paid` event -- which must also
+        # be subscribed to in the Razorpay Dashboard webhook config for
+        # the human/Payment-Links rail to ever get captured by a real
+        # webhook. The agent/Orders-API rail doesn't need it: its order
+        # is created upfront with a known razorpay_order_id, which
+        # `payment.captured` always echoes back in payment.entity.order_id.
+        payment_link_id = _dig(payload, "payload", "payment_link", "entity").get("id")
         razorpay_order_id = payment_entity.get("order_id")
 
         order = None

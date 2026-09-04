@@ -150,9 +150,11 @@ catalog is also exposed as an MCP resource, `merchant://catalog`.
 
 ### 4. Audit trail
 ```
-GET http://127.0.0.1:8123/audit-trail
+GET http://127.0.0.1:8123/merchants/demo_merchant/audit-trail?session_id=<your session_id>
 ```
-Shows every action from both flows, interleaved, in order.
+Shows every action from both flows, interleaved, in order. Requires a
+valid session whose own `merchant_id` matches the one in the URL —
+mint one first with `POST /session/human` if you don't have one handy.
 
 ## Guardrails, explained
 
@@ -324,11 +326,11 @@ Set" at the other) to demonstrate that every lookup is scoped by
   never from the request body. `merchant_id` is a real column on every
   cart/order/audit-log row too, not just resolved via a session join.
 - **The audit trail is merchant-scoped ONLY — there is no global or
-  unauthenticated read path.** `GET /merchants/{merchant_id}/audit-trail`
-  (and the backward-compatible `GET /audit-trail?session_id=...` alias)
-  strictly require a valid session, and that session's own
-  `merchant_id` is the only one it can ever see — a session from one
-  merchant gets a `403` reading another's trail, on both routes
+  unauthenticated read path, and no un-prefixed alias either.**
+  `GET /merchants/{merchant_id}/audit-trail` is the only route to this
+  data; it strictly requires a valid session, and that session's own
+  `merchant_id` must match the `merchant_id` in the URL — a session
+  from one merchant gets a `403` reading another's trail
   (`backend/tests/test_multitenancy.py`,
   `backend/tests/test_webhook_security.py`).
 
@@ -424,13 +426,6 @@ that shouldn't happen without you choosing to do it.
 
 ## Known limitations (honesty over polish)
 
-- `GET /audit-trail` is still global across every merchant (unfiltered
-  by `merchant_id`) — `GET /metrics` is NOT (see "Multi-tenancy"
-  above, `?merchant_id=...` or `/merchants/{id}/metrics`). Filtering
-  the raw audit trail itself the same way is the same technique, just
-  not done yet — lower priority since the trail is mainly read
-  narratively (`GET /audit-trail`, `web_chat/audit-dashboard.html`),
-  not aggregated, so a demo with two merchants reads fine unfiltered.
 - `POST /webhook/razorpay` has been verified against real Razorpay
   payloads and signature verification logic, but has never actually
   been *called* by a real Razorpay deployment in this environment —

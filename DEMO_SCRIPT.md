@@ -167,7 +167,8 @@ curl -X POST http://127.0.0.1:8123/checkout -H "Content-Type: application/json" 
 Expect: `200`, `note` field contains `recovered_after_retry`. Under
 the hood this made a genuinely invalid first request (`amount=0`),
 which Razorpay's real API genuinely rejected with a real `400` --
-check `GET /audit-trail` for the `checkout_payment` entry's
+check `GET /merchants/demo_merchant/audit-trail?session_id=$HUMAN_SESSION`
+for the `checkout_payment` entry's
 `first_attempt_response` field to see that real rejection body. In
 mock mode (no Razorpay keys) the same 400 JSON shape is simulated
 locally, so this scenario works identically either way. (The agent
@@ -237,9 +238,9 @@ returns THAT session's own merchant's rows — there's no global or
 unauthenticated view (point this out as the multi-tenant data-leak fix):
 
 ```bash
-curl "http://127.0.0.1:8123/audit-trail?session_id=$AGENT_SESSION"
+curl "http://127.0.0.1:8123/merchants/demo_merchant/audit-trail?session_id=$AGENT_SESSION"
 ```
-Or open in a browser: `http://127.0.0.1:8123/audit-trail?session_id=$AGENT_SESSION`
+Or open in a browser: `http://127.0.0.1:8123/merchants/demo_merchant/audit-trail?session_id=$AGENT_SESSION`
 
 Point out: every action above appears with actor, amount, and status
 -- nothing from either rail is missing. `policy_decision` entries (new)

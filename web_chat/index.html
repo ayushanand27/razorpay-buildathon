@@ -14,6 +14,20 @@
   .bot { background:#fff; margin-right:auto; }
   .user { background:#dcf8c6; margin-left:auto; }
   .sys { background:#fff3cd; margin:6px auto; text-align:center; font-size:12px; color:#856404; max-width:90%; }
+  .msg a { color:#075e54; font-weight:600; word-break:break-all; }
+  .pay-link { display:inline-block; margin-top:4px; background:#25d366; color:#fff !important; text-decoration:none;
+              padding:8px 16px; border-radius:20px; font-weight:600; word-break:normal; }
+  .pay-link:hover { background:#1fb855; }
+  .add-btn { background:none; border:1px solid #128c7e; color:#128c7e; border-radius:14px; padding:3px 10px;
+             font-size:12px; cursor:pointer; margin-top:2px; }
+  .add-btn:hover { background:#128c7e; color:#fff; }
+  .add-btn:disabled { border-color:#ccc; color:#aaa; cursor:not-allowed; }
+  .typing { display:inline-flex; gap:3px; align-items:center; }
+  .typing span { width:6px; height:6px; border-radius:50%; background:#999; animation: typing-bounce 1.2s infinite ease-in-out; }
+  .typing span:nth-child(2) { animation-delay:.2s; }
+  .typing span:nth-child(3) { animation-delay:.4s; }
+  @keyframes typing-bounce { 0%,60%,100% { transform:translateY(0); opacity:.4; } 30% { transform:translateY(-4px); opacity:1; } }
+  .quick button:disabled, #sendBtn:disabled { opacity:.5; cursor:not-allowed; }
   #inputRow { display:flex; border-top:1px solid #ddd; }
   #inputBox { flex:1; padding:12px; border:none; outline:none; font-size:14px; }
   #sendBtn { background:#075e54; color:#fff; border:none; padding:0 20px; cursor:pointer; }
@@ -47,7 +61,7 @@
     <button onclick="send('fail demo')">Trigger failure demo</button>
   </div>
   <div id="inputRow">
-    <input id="inputBox" placeholder="Type a message..." onkeydown="if(event.key==='Enter')send()"/>
+    <input id="inputBox" placeholder="Type a message..." autofocus onkeydown="if(event.key==='Enter')send()"/>
     <button id="sendBtn" onclick="send()">Send</button>
   </div>
 </div>
@@ -83,6 +97,21 @@ function botHTML(html) {
   el.innerHTML = html;
   document.getElementById('log').appendChild(el);
   document.getElementById('log').scrollTop = 1e9;
+  return el;
+}
+
+function showTyping() {
+  return botHTML('<span class="typing"><span></span><span></span><span></span></span>');
+}
+
+// Disables input while a request is in flight -- without this, rapidly
+// double-clicking "Checkout" (or any quick-action button) fires two
+// overlapping requests; the backend's idempotency handling absorbs
+// that safely, but the UI shouldn't invite it in the first place.
+function setBusy(busy) {
+  document.getElementById('inputBox').disabled = busy;
+  document.getElementById('sendBtn').disabled = busy;
+  document.querySelectorAll('.quick button').forEach(b => b.disabled = busy);
 }
 
 async function api(path, opts) {
@@ -113,12 +142,13 @@ async function showCatalog() {
   let html = "Here's what we have:<br>";
   data.products.forEach(p => {
     const thumb = CATEGORY_THUMB[p.category] || { color: '#999', icon: '🛒' };
-    const stockLine = p.stock === 0
+    const oos = p.stock === 0;
+    const stockLine = oos
       ? '<span class="out-of-stock">OUT OF STOCK</span>'
-      : `Rs.${p.price_inr}`;
+      : `Rs.${p.price_inr} &nbsp; <button class="add-btn" onclick="this.disabled=true;addItem('${p.id}')">+ Add</button>`;
     html += `<div class="product-card"><div class="product-thumb" style="background:${thumb.color}">${thumb.icon}</div><div class="product-info"><div class="name">${escapeHTML(p.id)} — ${escapeHTML(p.name)}</div><div>${stockLine}</div></div></div>`;
   });
-  html += "<br>Reply like: add sku_001";
+  html += "<br>Or just type: add sku_001";
   botHTML(html);
 }
 
@@ -131,7 +161,8 @@ async function addItem(sku) {
   bot(`Added! Cart total: Rs.${data.total_inr}`);
   if (data.upsell) {
     const u = data.upsell;
-    bot(`💡 ${u.name} — Rs.${u.price_inr}\n${u.reason}\nReply: add ${u.product_id}`);
+    botHTML(`💡 ${escapeHTML(u.name)} — Rs.${u.price_inr}<br>${escapeHTML(u.reason)}<br>` +
+            `<button class="add-btn" onclick="this.disabled=true;addItem('${u.product_id}')">+ Add ${escapeHTML(u.product_id)}</button>`);
   }
 }
 
@@ -155,7 +186,8 @@ async function doCheckout(simulateFailure=false) {
   if (data.note && data.note.includes('recovered')) {
     sys("[audit] first attempt failed, agent retried automatically — recovered");
   }
-  bot(`All set! Pay here: ${data.payment_link}\nAmount: Rs.${data.amount_inr}`);
+  botHTML(`All set! Amount: Rs.${data.amount_inr}<br>` +
+          `<a class="pay-link" href="${escapeHTML(data.payment_link)}" target="_blank" rel="noopener noreferrer">Pay now →</a>`);
   sys("[audit] checkout_payment logged");
 }
 
@@ -192,15 +224,23 @@ async function send(preset) {
   log(text, 'user');
   box.value = '';
 
-  // Exact command shortcuts stay first and unchanged -- deterministic,
-  // no network round-trip, reliable for the recorded demo.
-  if (text === 'catalog') return showCatalog();
-  if (text === 'cart') return showCart();
-  if (text === 'checkout') return doCheckout(false);
-  if (text === 'fail demo') return doCheckout(true);
-  if (text.startsWith('add ')) return addItem(text.split(' ')[1].trim());
+  setBusy(true);
+  const typingEl = showTyping();
+  try {
+    // Exact command shortcuts stay first and unchanged -- deterministic,
+    // no network round-trip, reliable for the recorded demo.
+    if (text === 'catalog') return await showCatalog();
+    if (text === 'cart') return await showCart();
+    if (text === 'checkout') return await doCheckout(false);
+    if (text === 'fail demo') return await doCheckout(true);
+    if (text.startsWith('add ')) return await addItem(text.split(' ')[1].trim());
 
-  return handleFreeText(text);
+    return await handleFreeText(text);
+  } finally {
+    typingEl.remove();
+    setBusy(false);
+    box.focus();
+  }
 }
 
 async function init() {

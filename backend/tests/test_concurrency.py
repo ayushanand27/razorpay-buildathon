@@ -86,7 +86,7 @@ def test_concurrent_checkout_same_idempotency_key_creates_only_one_order(client)
     assert all(r.status_code == 200 for r in responses)
     assert responses[0].json() == responses[1].json()
 
-    entries = client.get("/audit-trail", params={"session_id": session_id}).json()["entries"]
+    entries = client.get("/merchants/demo_merchant/audit-trail", params={"session_id": session_id}).json()["entries"]
     payment_entries = [e for e in entries if e["action"] == "checkout_payment"]
     assert len(payment_entries) == 1, "concurrent duplicate requests must produce exactly one order"
 
@@ -107,7 +107,7 @@ def test_concurrent_agent_pay_same_idempotency_key_creates_only_one_order(client
     assert all(r.status_code == 200 for r in responses)
     assert responses[0].json() == responses[1].json()
 
-    entries = client.get("/audit-trail", params={"session_id": session_id}).json()["entries"]
+    entries = client.get("/merchants/demo_merchant/audit-trail", params={"session_id": session_id}).json()["entries"]
     payment_entries = [e for e in entries if e["action"] == "checkout_payment"]
     assert len(payment_entries) == 1
 

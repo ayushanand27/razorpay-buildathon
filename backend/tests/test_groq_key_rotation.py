@@ -3,6 +3,8 @@ Covers groq_keys.py's rotation logic in isolation (no network, no
 dependency on nlu.py/upsell_copy.py's own fallback behavior).
 """
 
+import pytest
+
 from app import groq_keys
 
 
@@ -54,10 +56,15 @@ def test_does_not_rotate_on_non_429_error():
     assert calls == ["primary_key"]
 
 
-def test_all_keys_exhausted_returns_last_429(monkeypatch):
+def test_all_keys_exhausted_raises_typed_quota_error(monkeypatch):
+    """Total exhaustion is a distinct, typed failure now -- not a plain
+    429 Response object a caller could forget to check the status code
+    on. keys_tried lets a caller log/monitor exactly how many keys were
+    burned through before giving up."""
     monkeypatch.setenv("GROQ_API_KEY_2", "backup_key")
-    resp = groq_keys.post_with_rotation(lambda key: _FakeResp(429), "primary_key")
-    assert resp.status_code == 429
+    with pytest.raises(groq_keys.QuotaExhaustedError) as exc_info:
+        groq_keys.post_with_rotation(lambda key: _FakeResp(429), "primary_key")
+    assert exc_info.value.keys_tried == 2
 
 
 def test_backup_keys_read_in_order(monkeypatch):

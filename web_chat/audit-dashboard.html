@@ -34,10 +34,17 @@
   .badge { display: inline-block; font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 999px; }
   .badge.human { background: #e8ecfd; color: #3346c4; }
   .badge.ai { background: #f1e6fd; color: #7a2fc4; }
+  .badge.webhook { background: #eef1f4; color: #4a5568; }
   .status { display: inline-block; font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 999px; text-transform: capitalize; }
-  .status.ok { background: #e6f4ea; color: #1e7a34; }
-  .status.blocked, .status.failed { background: #fdecea; color: #b3261e; }
-  .status.retried { background: #fff6dd; color: #96720c; }
+  /* Success/settled -- money genuinely moved or a check genuinely passed. */
+  .status.ok, .status.paid, .status.verified, .status.refunded { background: #e6f4ea; color: #1e7a34; }
+  /* Failure/blocked -- a guardrail or policy check stopped something,
+     or a webhook was rejected outright. */
+  .status.blocked, .status.failed, .status.capture_failed,
+  .status.invalid_signature, .status.expired_timestamp { background: #fdecea; color: #b3261e; }
+  /* Neutral/informational -- happened, no money impact either way, or
+     recovered automatically. */
+  .status.retried, .status.replayed, .status.unmatched, .status.capturing { background: #fff6dd; color: #96720c; }
   .amount { font-variant-numeric: tabular-nums; }
   .details { color: #6b6b75; }
   .loading, .error, .empty { color: #8a8a92; font-size: 14px; padding: 40px 0; text-align: center; }
@@ -63,13 +70,15 @@
 
 <script>
 const BACKEND = "http://127.0.0.1:8123";
+const MERCHANT_ID = "demo_merchant";
 const REFRESH_MS = 5000;
 
-// GET /audit-trail now strictly requires a valid session and only ever
-// returns THAT session's own merchant's rows -- there is no
-// unauthenticated/global read path left on the backend. This
-// dashboard mints one lightweight human session once, on load, purely
-// to view demo_merchant's own trail (it's never used to buy anything).
+// GET /merchants/{merchant_id}/audit-trail strictly requires a valid
+// session whose OWN merchant_id matches the one in the URL -- there is
+// no unauthenticated or un-prefixed global read path left on the
+// backend at all. This dashboard mints one lightweight human session
+// once, on load, purely to view demo_merchant's own trail (it's never
+// used to buy anything).
 let sessionIdPromise = null;
 async function getSessionId() {
   if (!sessionIdPromise) {
@@ -90,8 +99,9 @@ function formatTime(unixSeconds) {
 }
 
 function actorBadge(actor) {
-  const isAI = actor === 'ai_agent_mcp';
-  return `<span class="badge ${isAI ? 'ai' : 'human'}">${isAI ? 'AI Agent' : 'Human'}</span>`;
+  if (actor === 'ai_agent_mcp') return '<span class="badge ai">AI Agent</span>';
+  if (actor === 'razorpay_webhook') return '<span class="badge webhook">Webhook</span>';
+  return '<span class="badge human">Human</span>';
 }
 
 function statusBadge(status) {
@@ -102,10 +112,15 @@ function formatDetails(action, status, detailsRaw) {
   let details = {};
   try { details = JSON.parse(detailsRaw || '{}'); } catch (e) { /* leave empty */ }
 
-  if (status === 'blocked' || status === 'failed') return escapeHTML(details.reason || 'blocked');
+  if (details.reason) return escapeHTML(details.reason);
   if (details.note) return escapeHTML(details.note);
   if (action === 'add_to_cart' && details.product_id) return `added ${escapeHTML(details.product_id)} x${details.qty}`;
+  if (action === 'payment_confirmed') {
+    return `${escapeHTML(details.order_id || '?')} via ${escapeHTML(details.source || 'webhook')}`;
+  }
+  if (action === 'webhook_received') return `event: ${escapeHTML(details.event || '?')}`;
   if (details.payment_link) return escapeHTML(details.payment_link);
+  if (details.order_id) return escapeHTML(details.order_id);
   return '—';
 }
 
@@ -113,7 +128,7 @@ async function loadTrail() {
   const wrap = document.getElementById('tableWrap');
   try {
     const sessionId = await getSessionId();
-    const res = await fetch(BACKEND + '/audit-trail?limit=50&session_id=' + encodeURIComponent(sessionId));
+    const res = await fetch(BACKEND + '/merchants/' + MERCHANT_ID + '/audit-trail?limit=50&session_id=' + encodeURIComponent(sessionId));
     const data = await res.json();
     if (!data.entries || !data.entries.length) {
       wrap.innerHTML = '<div class="empty">No actions logged yet — try the chat or MCP flow.</div>';

@@ -210,9 +210,13 @@ def get_audit_trail(limit: int = 10, session_id: str | None = None) -> dict:
     """View recent audit log entries -- every action this buyer's own
     merchant has logged (human or AI actor), for transparency. The
     backend strictly scopes this to the caller's own session's
-    merchant -- there is no unauthenticated or cross-merchant view."""
+    merchant -- there is no unauthenticated or cross-merchant view.
+    There is no un-prefixed /audit-trail route anymore either -- every
+    caller names the merchant_id it's reading explicitly, matched
+    against its own session."""
     sid = _resolve_session(session_id)
-    resp = requests.get(f"{BACKEND_URL}/audit-trail", params={"limit": limit, "session_id": sid}, timeout=10)
+    resp = requests.get(f"{BACKEND_URL}/merchants/{MERCHANT_ID}/audit-trail",
+                         params={"limit": limit, "session_id": sid}, timeout=10)
     resp.raise_for_status()
     return {**resp.json(), "session_id": sid}
 

@@ -13,7 +13,7 @@ import json
 import time
 import uuid
 
-from app import catalog, nlu, sessions
+from app import catalog, groq_keys, nlu, sessions
 
 DEFAULT_CATEGORIES = ["electronics", "apparel", "home", "stationery"]
 
@@ -112,7 +112,7 @@ def test_upsell_blocked_by_cap_logged_and_counted(client):
     assert resp.status_code == 200
     assert resp.json()["upsell"] is None
 
-    entries = client.get("/audit-trail", params={"session_id": session_id}).json()["entries"]
+    entries = client.get("/merchants/demo_merchant/audit-trail", params={"session_id": session_id}).json()["entries"]
     blocked_entry = next(e for e in entries if e["action"] == "upsell_blocked")
     assert blocked_entry["status"] == "blocked"
     details = json.loads(blocked_entry["details"])
@@ -143,7 +143,7 @@ def test_upsell_blocked_by_human_max_order(client):
     assert resp.status_code == 200
     assert resp.json()["upsell"] is None
 
-    entries = client.get("/audit-trail", params={"session_id": session_id}).json()["entries"]
+    entries = client.get("/merchants/demo_merchant/audit-trail", params={"session_id": session_id}).json()["entries"]
     blocked_entry = next(e for e in entries if e["action"] == "upsell_blocked")
     assert json.loads(blocked_entry["details"])["reason"] == "would_exceed_cap"
 
@@ -155,6 +155,64 @@ def test_upsell_blocked_by_human_max_order(client):
 def test_nlu_no_api_key_always_falls_back():
     # conftest forces GROQ_API_KEY="" for the whole test session.
     plan = nlu.parse_turn("demo_merchant", "add the bottle and the earbuds")
+    assert plan == {"tool": "clarify", "message": nlu.FALLBACK_MESSAGE}
+
+
+# ---------------------------------------------------------------------
+# StaticFallbackNLU -- the explicit, typed takeover on ANY Groq failure
+# ---------------------------------------------------------------------
+
+def test_static_fallback_nlu_routes_fast_path_phrasings_directly():
+    """Calling StaticFallbackNLU directly (not via parse_turn) must
+    behave identically to parse_turn()'s own fast path -- it's a
+    complete, self-contained deterministic router, not a helper that
+    only works when parse_turn() has already done some of the work."""
+    assert nlu.StaticFallbackNLU("test").route("pay") == {"tool": "checkout"}
+    assert nlu.StaticFallbackNLU("test").route("my cart") == {"tool": "view_cart"}
+    assert nlu.StaticFallbackNLU("test").route("catalog") == {"tool": "browse", "category": None}
+
+
+def test_static_fallback_nlu_falls_back_to_fixed_clarify_for_anything_else():
+    plan = nlu.StaticFallbackNLU("test").route("something totally unrelated to shopping")
+    assert plan == {"tool": "clarify", "message": nlu.FALLBACK_MESSAGE}
+
+
+def test_static_fallback_nlu_logs_a_warning_naming_the_reason(caplog):
+    import logging
+    with caplog.at_level(logging.WARNING, logger="app.nlu"):
+        nlu.StaticFallbackNLU("groq_quota_exhausted:keys_tried=3")
+    assert any("groq_quota_exhausted:keys_tried=3" in r.message for r in caplog.records)
+
+
+def test_parse_turn_routes_through_static_fallback_on_quota_exhaustion(monkeypatch, caplog):
+    """A total-quota-exhaustion signal from groq_keys (raised inside
+    _call_groq) must be caught SPECIFICALLY and routed through
+    StaticFallbackNLU -- not swallowed into the same generic bucket as
+    a malformed response or a network error, and not left to propagate
+    as an unhandled exception up to the FastAPI route."""
+    monkeypatch.setattr(nlu, "GROQ_API_KEY", "fake_key_for_test")
+
+    def _raise_quota_exhausted(merchant_id, text):
+        raise groq_keys.QuotaExhaustedError(keys_tried=3)
+
+    monkeypatch.setattr(nlu, "_call_groq", _raise_quota_exhausted)
+
+    import logging
+    with caplog.at_level(logging.WARNING, logger="app.nlu"):
+        plan = nlu.parse_turn("demo_merchant", "something ambiguous that needs Groq")
+
+    assert plan == {"tool": "clarify", "message": nlu.FALLBACK_MESSAGE}
+    assert any("groq_quota_exhausted" in r.message for r in caplog.records)
+
+
+def test_parse_turn_routes_through_static_fallback_on_invalid_groq_response(monkeypatch):
+    """A non-quota failure (bad tool name, unparseable response, ...)
+    -- surfaced by _call_groq returning a falsy/invalid plan rather
+    than raising -- also routes through StaticFallbackNLU, distinctly
+    from the quota-exhaustion path."""
+    monkeypatch.setattr(nlu, "GROQ_API_KEY", "fake_key_for_test")
+    monkeypatch.setattr(nlu, "_call_groq", lambda merchant_id, text: {"tool": "not_a_real_tool"})
+    plan = nlu.parse_turn("demo_merchant", "something ambiguous that needs Groq")
     assert plan == {"tool": "clarify", "message": nlu.FALLBACK_MESSAGE}
 
 
@@ -256,7 +314,7 @@ def test_nlu_turn_add_plan_shows_real_upsell(client, monkeypatch):
     assert body["tool"] == "add"
     assert body["data"][0]["upsell"]["product_id"] == "sku_003"
     # Went through the real add_to_cart() -- audit trail proves it.
-    entries = client.get("/audit-trail", params={"session_id": session_id}).json()["entries"]
+    entries = client.get("/merchants/demo_merchant/audit-trail", params={"session_id": session_id}).json()["entries"]
     assert any(e["action"] == "add_to_cart" and e["status"] == "ok" for e in entries)
 
 

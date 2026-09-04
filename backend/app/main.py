@@ -15,11 +15,13 @@ New merchant-scoped endpoints:
   GET  /merchants/{merchant_id}/audit-trail     -- session-gated, merchant-scoped ONLY
   POST /merchants/{merchant_id}/session/human
   POST /merchants/{merchant_id}/session/agent
-The original un-prefixed /catalog, /session/human, /session/agent,
-/audit-trail routes still work, as thin aliases for
-merchant_id="demo_merchant" (or, for /audit-trail, resolved from the
-caller's own session) -- kept so the existing web chat and MCP server
-need no changes.
+The original un-prefixed /catalog, /session/human, /session/agent
+routes still work, as thin aliases for merchant_id="demo_merchant" --
+kept so the existing web chat and MCP server need no changes. There is
+NO un-prefixed /audit-trail alias -- that data is sensitive enough
+that every caller must name the merchant_id it's reading explicitly in
+the URL, matched against its own session, rather than relying on an
+implicit default.
 
 Split payment rails:
   - Human (POST /checkout): Razorpay Payment Links -- a human opens
@@ -61,6 +63,7 @@ transaction open across a network round trip would be its own bug
 import json
 import time
 import uuid
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -70,7 +73,21 @@ from . import (audit, cart, catalog, db, guardrails, merchant_registry, metrics,
                payments, policy, sessions, webhooks)
 from .guardrails import GuardrailBlocked, check_cart_reviewed, check_checkout_allowed
 
-app = FastAPI(title="Agentic Commerce Demo Backend")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Seeds the two demo merchants into app.db on real process startup
+    -- a fresh database otherwise has ZERO merchants and every session/
+    catalog call 404s as unknown_merchant. Idempotent (only inserts a
+    merchant that doesn't already exist), so this is safe to run on
+    every restart against an already-seeded app.db too. Tests don't
+    rely on this firing (TestClient only runs lifespan when used as a
+    context manager) -- conftest.py seeds explicitly per test instead."""
+    db.seed_default_merchants()
+    yield
+
+
+app = FastAPI(title="Agentic Commerce Demo Backend", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -244,18 +261,6 @@ def session_agent(req: AgentWarrantRequest):
 @app.get("/catalog")
 def get_catalog(category: str | None = None):
     return {"products": _list_catalog("demo_merchant", category)}
-
-
-@app.get("/audit-trail")
-def audit_trail(session_id: str, limit: int = 50):
-    """Resolves merchant_id from the caller's OWN session -- a client
-    can never pass a different merchant_id to see someone else's
-    trail. Kept at this un-prefixed path for backward compatibility
-    (web_chat/audit-dashboard.html, mcp_server); functionally identical
-    to GET /merchants/{merchant_id}/audit-trail with that session's own
-    merchant_id."""
-    session = _require_session(session_id)
-    return {"entries": audit.get_trail(session["merchant_id"], limit)}
 
 
 @app.post("/cart/add")

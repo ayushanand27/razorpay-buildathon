@@ -86,7 +86,7 @@ def capture_human_order(client, payment_link_id, amount_inr):
 
 
 def last_checkout_payment_details(client, session_id):
-    entries = client.get("/audit-trail", params={"session_id": session_id}).json()["entries"]
+    entries = client.get("/merchants/demo_merchant/audit-trail", params={"session_id": session_id}).json()["entries"]
     entry = next(e for e in entries if e["action"] == "checkout_payment")
     return json.loads(entry["details"])
 
@@ -342,7 +342,7 @@ def test_pay_without_confirm_blocks_and_creates_no_order(client):
     assert resp.status_code == 400
 
     # No order, no policy decision, no payment attempt of any kind.
-    entries = client.get("/audit-trail", params={"session_id": session_id}).json()["entries"]
+    entries = client.get("/merchants/demo_merchant/audit-trail", params={"session_id": session_id}).json()["entries"]
     assert not any(e["action"] in ("policy_decision", "checkout_payment") for e in entries)
 
 
@@ -422,7 +422,7 @@ def test_double_submit_same_idempotency_key_returns_original_order_human(client)
     assert second.status_code == 200
     assert second.json() == first_body
 
-    payment_entries = [e for e in client.get("/audit-trail", params={"session_id": session_id}).json()["entries"]
+    payment_entries = [e for e in client.get("/merchants/demo_merchant/audit-trail", params={"session_id": session_id}).json()["entries"]
                         if e["action"] == "checkout_payment"]
     assert len(payment_entries) == 1
 
@@ -440,7 +440,7 @@ def test_double_submit_same_idempotency_key_returns_original_order_agent(client)
     assert second.status_code == 200
     assert second.json() == first_body
 
-    payment_entries = [e for e in client.get("/audit-trail", params={"session_id": session_id}).json()["entries"]
+    payment_entries = [e for e in client.get("/merchants/demo_merchant/audit-trail", params={"session_id": session_id}).json()["entries"]
                         if e["action"] == "checkout_payment"]
     assert len(payment_entries) == 1
 
@@ -513,7 +513,7 @@ def test_capture_failure_restores_stock(client):
     cap_resp = capture_human_order(client, payment_link_id, 249 * 5)
     assert cap_resp.status_code == 200
 
-    entries = client.get("/audit-trail", params={"session_id": session_id}).json()["entries"]
+    entries = client.get("/merchants/demo_merchant/audit-trail", params={"session_id": session_id}).json()["entries"]
     confirmed = next(e for e in entries if e["action"] == "payment_confirmed")
     assert confirmed["status"] == "capture_failed"
     assert "insufficient_stock" in json.loads(confirmed["details"])["reason"]

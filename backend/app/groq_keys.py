@@ -7,9 +7,35 @@ chat turns. If you have a backup key, set GROQ_API_KEY_2 (and _3, _4,
 next automatically, before falling back to the static/fixed-hint
 behavior either module already has. With no backup keys configured,
 nothing about existing behavior changes -- this is purely additive.
+
+Total quota exhaustion (every configured key came back 429) is a
+DISTINCT, typed failure (QuotaExhaustedError), not just "some other
+Response object" for the caller to inspect a status code on -- a
+caller that wants to tell "we're out of quota" apart from "Groq's API
+had a network blip" (nlu.py's StaticFallbackNLU does exactly that)
+needs a signal it can catch specifically, not a return value that
+looks the same either way. This module also logs the exhaustion itself
+(once, here, at the single chokepoint both callers share) so it's
+visible in ordinary application logs/monitoring even for a caller that
+only cares about the end result, not the reason.
 """
 
+import logging
 import os
+
+logger = logging.getLogger(__name__)
+
+
+class QuotaExhaustedError(Exception):
+    """Raised when EVERY configured Groq key (primary + all backups)
+    returned 429 for this call. Callers that want to distinguish total
+    quota exhaustion from a transient network/response error (rather
+    than silently falling back the same way for both) should catch
+    this specifically."""
+
+    def __init__(self, keys_tried: int):
+        self.keys_tried = keys_tried
+        super().__init__(f"all {keys_tried} configured Groq key(s) returned 429 (quota exhausted)")
 
 
 def backup_keys() -> list[str]:
@@ -29,15 +55,20 @@ def post_with_rotation(post_fn, primary_key: str, *args, **kwargs):
     primary key (if set), then each backup key in turn, stopping at
     the first non-429 response (success, or a real error worth
     surfacing as-is -- only "rate limit exhausted" warrants trying a
-    different key). Returns None if no key was configured at all."""
+    different key).
+
+    Returns None if no key was configured at all (nothing to call).
+    Raises QuotaExhaustedError if at least one key was configured and
+    EVERY one of them came back 429 -- this is an explicit, monitored
+    failure mode, not a value indistinguishable from "no key set"."""
     keys = [k for k in [primary_key, *backup_keys()] if k]
     if not keys:
         return None
 
-    last_resp = None
     for key in keys:
         resp = post_fn(key, *args, **kwargs)
-        last_resp = resp
         if resp.status_code != 429:
             return resp
-    return last_resp
+
+    logger.warning("groq_quota_exhausted: all %d configured Groq key(s) returned 429", len(keys))
+    raise QuotaExhaustedError(len(keys))

@@ -24,11 +24,15 @@ LLM -- it's a display-side filter over the real catalog, never an
 amount used in a charge.
 
 On ANY failure (no key, timeout, network error, bad/unparseable
-response, an unrecognized tool name) falls back to `clarify` with a
-fixed hint -- never guesses at a purchase, never blocks the chat.
+response, an unrecognized tool name, or every configured key having
+exhausted its quota) control passes EXPLICITLY to StaticFallbackNLU
+below -- never guesses at a purchase, never blocks the chat, and never
+silently drops the request into an unhandled state: every fallback
+path is logged with the specific reason it was taken.
 """
 
 import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -39,6 +43,8 @@ from dotenv import load_dotenv
 from . import catalog, groq_keys
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+
+logger = logging.getLogger(__name__)
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -94,6 +100,34 @@ _BANNED_KEYS = ("price", "price_inr", "amount", "amount_inr", "total_inr", "allo
 
 def _fallback() -> dict:
     return {"tool": "clarify", "message": FALLBACK_MESSAGE}
+
+
+class StaticFallbackNLU:
+    """The deterministic, LLM-free intent router this module falls back
+    to EXPLICITLY whenever Groq isn't usable for any reason -- no key
+    configured, a network/timeout error, a malformed/unparseable
+    response, an unrecognized tool name, or every configured key having
+    exhausted its quota (groq_keys.QuotaExhaustedError). This is a
+    named, typed takeover, not an implicit `return None` a caller has
+    to interpret -- constructing one always logs a standard warning
+    naming the specific reason, so a spike in any one reason (quota
+    exhaustion especially) is visible in ordinary application logs/
+    monitoring, not just inferred from a drop in Groq-attributed
+    intents.
+
+    Routes through the SAME fixed-phrasing fast path
+    (_try_fast_path) parse_turn() already tries before ever calling
+    Groq, then the fixed clarify message -- so calling this directly
+    (e.g. in a test, or from a future non-HTTP caller) behaves
+    identically to going through parse_turn() with Groq unavailable,
+    without needing to reproduce that fallback sequencing by hand."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        logger.warning("nlu_static_fallback_engaged: reason=%s", reason)
+
+    def route(self, text: str) -> dict:
+        return _try_fast_path(text) or _fallback()
 
 
 def _extract_price_ceiling(text: str) -> float | None:
@@ -159,10 +193,25 @@ def _post_groq(key: str, merchant_id: str, text: str):
 
 
 def _call_groq(merchant_id: str, text: str) -> dict | None:
+    """Returns a parsed plan dict, or None on any non-quota failure
+    (network/timeout error, non-2xx response, unparseable content).
+    Raises groq_keys.QuotaExhaustedError specifically when every
+    configured key came back 429 -- deliberately NOT swallowed into a
+    bare None here, so parse_turn() can route that one specific case
+    through StaticFallbackNLU with its own distinct, logged reason
+    instead of an indistinguishable generic failure."""
     try:
         resp = groq_keys.post_with_rotation(_post_groq, GROQ_API_KEY, merchant_id, text)
-        if resp is None:
-            return None
+    except groq_keys.QuotaExhaustedError:
+        raise
+    except Exception:
+        logger.warning("nlu_groq_request_failed: network/transport error calling Groq", exc_info=True)
+        return None
+
+    if resp is None:
+        return None
+
+    try:
         resp.raise_for_status()
         content = resp.json()["choices"][0]["message"]["content"].strip()
         # Some models (reasoning variants) prepend a <think>...</think>
@@ -181,6 +230,7 @@ def _call_groq(merchant_id: str, text: str) -> dict | None:
             plan = json.loads(match.group(0))
         return plan if isinstance(plan, dict) else None
     except Exception:
+        logger.warning("nlu_groq_response_unusable: non-2xx or malformed response shape", exc_info=True)
         return None
 
 
@@ -194,11 +244,15 @@ def parse_turn(merchant_id: str, text: str) -> dict:
         return fast
 
     if not GROQ_API_KEY:
-        return _fallback()
+        return StaticFallbackNLU("no_api_key_configured").route(text)
 
-    plan = _call_groq(merchant_id, text)
+    try:
+        plan = _call_groq(merchant_id, text)
+    except groq_keys.QuotaExhaustedError as exc:
+        return StaticFallbackNLU(f"groq_quota_exhausted:keys_tried={exc.keys_tried}").route(text)
+
     if not plan or plan.get("tool") not in ALLOWED_TOOLS:
-        return _fallback()
+        return StaticFallbackNLU("invalid_or_missing_groq_response").route(text)
 
     for key in _BANNED_KEYS:
         plan.pop(key, None)

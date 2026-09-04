@@ -86,7 +86,7 @@ def test_refund_human_order_via_payment_link_rail(client):
     assert checkout_resp.status_code == 200
     order_id = checkout_resp.json()["order_id"]
 
-    entries = client.get("/audit-trail", params={"session_id": session_id}).json()["entries"]
+    entries = client.get("/merchants/demo_merchant/audit-trail", params={"session_id": session_id}).json()["entries"]
     import json as json_module
     payment_link_id = next(
         json_module.loads(e["details"])["payment_link_id"] for e in entries if e["action"] == "checkout_payment"

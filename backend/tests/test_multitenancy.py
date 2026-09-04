@@ -254,7 +254,7 @@ def test_stock_decrement_at_one_merchant_does_not_touch_the_others_sku(client):
     from app import webhooks
     import json as json_module
     payment_link_id = None
-    for entry in client.get("/audit-trail", params={"session_id": session_id}).json()["entries"]:
+    for entry in client.get(f"/merchants/{FIT_SUPPLY}/audit-trail", params={"session_id": session_id}).json()["entries"]:
         if entry["action"] == "checkout_payment":
             payment_link_id = json_module.loads(entry["details"])["payment_link_id"]
             break
