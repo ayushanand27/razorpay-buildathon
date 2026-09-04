@@ -16,6 +16,7 @@ demo process's own database files.
 import os
 
 os.environ.setdefault("AGENT_WARRANT_SECRET", "test_warrant_secret_do_not_use_in_prod")
+os.environ.setdefault("FIT_SUPPLY_WARRANT_SECRET", "test_fit_supply_warrant_secret_do_not_use_in_prod")
 os.environ.setdefault("MERCHANT_ID", "demo_merchant")
 os.environ["RAZORPAY_KEY_ID"] = ""
 os.environ["RAZORPAY_KEY_SECRET"] = ""

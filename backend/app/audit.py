@@ -63,25 +63,39 @@ def get_trail(limit: int = 100):
     return [dict(zip(cols, r)) for r in rows]
 
 
-def captured_spend_today(actor: str) -> float:
+def captured_spend_today(merchant_id: str, actor: str) -> float:
     """Sum of this actor's CAPTURED (payment_confirmed, status=paid)
-    transactions today -- not merely order/link-created ones. This is
-    the `spend_today` input policy.evaluate() needs for its daily-cap
-    rule; computed here (a plain query) rather than inside policy.py
-    so that module stays a pure function of its inputs, with no I/O of
-    its own."""
+    transactions AT THIS MERCHANT today -- not merely order/link-created
+    ones, and not spend at a DIFFERENT merchant (a warrant's daily cap
+    is itself per-(agent, merchant); the audit_log schema has no
+    merchant_id column of its own, so this resolves each row's actor_id
+    -- which is always the session_id, see log_action()'s call sites --
+    back to its merchant via sessions.get_session() and filters).
+
+    This is the `spend_today` input policy.evaluate() needs for its
+    daily-cap rule; computed here (a plain query) rather than inside
+    policy.py so that module stays a pure function of its inputs, with
+    no I/O of its own."""
+    from . import sessions  # local import -- avoids a circular import at module load time
+
     conn = _get_conn()
     try:
-        row = conn.execute(
+        rows = conn.execute(
             """
-            SELECT COALESCE(SUM(amount_inr), 0.0) FROM audit_log
+            SELECT actor_id, amount_inr FROM audit_log
             WHERE actor = ?
               AND action = 'payment_confirmed'
               AND status = 'paid'
               AND date(timestamp, 'unixepoch', 'localtime') = date('now', 'localtime')
             """,
             (actor,),
-        ).fetchone()
-        return row[0]
+        ).fetchall()
     finally:
         conn.close()
+
+    total = 0.0
+    for session_id, amount_inr in rows:
+        session = sessions.get_session(session_id)
+        if session and session.get("merchant_id") == merchant_id:
+            total += amount_inr or 0.0
+    return total

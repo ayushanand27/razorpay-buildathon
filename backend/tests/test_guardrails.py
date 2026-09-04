@@ -366,7 +366,7 @@ def test_capture_then_revenue(client):
     assert metrics["revenue_by_actor"]["ai_agent_mcp"] == 349.0
 
     # Stock actually decremented too, same as the human rail's capture step.
-    assert catalog.get_product("sku_003")["stock"] == 59
+    assert catalog.get_product("demo_merchant", "sku_003")["stock"] == 59
 
 
 # ---------------------------------------------------------------------
@@ -443,7 +443,7 @@ def test_double_submit_same_idempotency_key_returns_original_order_agent(client)
     assert len(payment_entries) == 1
 
     # Only ONE capture -- stock decremented exactly once.
-    assert catalog.get_product("sku_001")["stock"] == 24
+    assert catalog.get_product("demo_merchant", "sku_001")["stock"] == 24
 
 
 def test_different_idempotency_key_same_session_creates_a_new_order(client):
@@ -478,18 +478,18 @@ def test_qty_over_stock_blocks_even_when_stock_is_positive(client):
 
 def test_stock_not_decremented_until_capture(client):
     session_id = make_human_session(client)
-    starting_stock = catalog.get_product("sku_001")["stock"]
+    starting_stock = catalog.get_product("demo_merchant", "sku_001")["stock"]
 
     add_and_review(client, session_id, "sku_001", qty=1)
     resp = client.post("/checkout", json={"session_id": session_id, "idempotency_key": new_idempotency_key()})
     assert resp.status_code == 200
 
-    assert catalog.get_product("sku_001")["stock"] == starting_stock  # unchanged -- not yet captured
+    assert catalog.get_product("demo_merchant", "sku_001")["stock"] == starting_stock  # unchanged -- not yet captured
 
     payment_link_id = last_checkout_payment_details(client)["payment_link_id"]
     capture_human_order(client, payment_link_id, 1499)
 
-    assert catalog.get_product("sku_001")["stock"] == starting_stock - 1  # decremented only now
+    assert catalog.get_product("demo_merchant", "sku_001")["stock"] == starting_stock - 1  # decremented only now
 
 
 def test_capture_failure_restores_stock(client):
@@ -506,7 +506,7 @@ def test_capture_failure_restores_stock(client):
 
     payment_link_id = last_checkout_payment_details(client)["payment_link_id"]
 
-    product = catalog.get_product("sku_004")
+    product = catalog.get_product("demo_merchant", "sku_004")
     stock_before_capture_attempt = 2
     product["stock"] = stock_before_capture_attempt
 
@@ -531,7 +531,7 @@ def test_agent_pay_reports_capture_failed_status_accurately(client, monkeypatch)
     add_and_review(client, session_id, "sku_001", qty=1)
     key = new_idempotency_key()
 
-    monkeypatch.setattr(catalog, "decrement_stock", lambda product_id, qty: False)
+    monkeypatch.setattr(catalog, "decrement_stock", lambda merchant_id, product_id, qty: False)
 
     resp = pay(client, session_id, idempotency_key=key)
     assert resp.status_code == 200

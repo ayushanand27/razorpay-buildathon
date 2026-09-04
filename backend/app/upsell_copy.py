@@ -1,11 +1,11 @@
 """
 Optional dynamic upsell copy.
 
-catalog.UPSELL_MAP still deterministically decides WHICH product gets
-suggested -- that's a "which SKU" decision an LLM call would be
-overkill for. This module only tries to write the one-line *reason*
-text tailored to what's actually in the cart, in place of the fixed
-string, when an API key is configured.
+Each merchant's own upsell_map (merchants.py) still deterministically
+decides WHICH product gets suggested -- that's a "which SKU" decision
+an LLM call would be overkill for. This module only tries to write the
+one-line *reason* text tailored to what's actually in the cart, in
+place of the fixed string, when an API key is configured.
 
 Uses Groq's free-tier API (OpenAI-compatible chat completions,
 Llama-hosted) -- no paid account needed, matching the rest of this

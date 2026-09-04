@@ -14,10 +14,13 @@ the two checks that apply to EVERY buyer, human or agent, live here.
 
 from . import catalog
 
-# Merchant-set ceiling on a single human order -- used only by
-# catalog.get_upsell() to avoid suggesting an add-on that would push a
-# human buyer's cart past a sane order size. NOT enforced at checkout
-# time (out of scope here -- only asked for as an upsell guard).
+# Fallback/default ceiling on a single human order, used only if a
+# merchant somehow isn't found in the registry (shouldn't happen in
+# practice -- every real caller resolves merchants.get_max_order_inr()
+# for the specific merchant the session belongs to instead). Used only
+# by catalog.get_upsell() to avoid suggesting an add-on that would push
+# a human buyer's cart past a sane order size; NOT enforced at checkout
+# time (out of scope -- only asked for as an upsell guard).
 MAX_ORDER_INR = 10_000
 
 
@@ -36,19 +39,19 @@ def check_cart_reviewed(reviewed: bool):
         raise GuardrailBlocked("cart_not_reviewed")
 
 
-def check_stock(line_items: list[dict]):
+def check_stock(merchant_id: str, line_items: list[dict]):
     """Per-line-item stock check -- a cart with ONE item at qty > stock
     must block even when every OTHER item in the same cart has plenty
     of stock. A single min(stock)-across-the-whole-cart check misses
     that case entirely."""
     for li in line_items:
-        product = catalog.get_product(li["product_id"])
+        product = catalog.get_product(merchant_id, li["product_id"])
         if product is None or li["qty"] > product["stock"]:
             raise GuardrailBlocked("out_of_stock")
 
 
-def check_checkout_allowed(line_items: list[dict]):
+def check_checkout_allowed(merchant_id: str, line_items: list[dict]):
     """Raises GuardrailBlocked if this (human-rail) checkout should not
     proceed."""
-    check_stock(line_items)
+    check_stock(merchant_id, line_items)
     return True

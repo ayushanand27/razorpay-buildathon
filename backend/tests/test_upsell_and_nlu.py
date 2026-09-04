@@ -58,7 +58,7 @@ def add_and_review(client, session_id, product_id, qty=1):
 
 def test_get_upsell_allows_when_within_cap():
     upsell, blocked = catalog.get_upsell(
-        "sku_001", cart_items=[{"product_id": "sku_001", "qty": 1, "price_inr": 1499}],
+        "demo_merchant", "sku_001", cart_items=[{"product_id": "sku_001", "qty": 1, "price_inr": 1499}],
         exclude_ids={"sku_001"}, max_cart_total_inr=5000,
     )
     assert blocked is None
@@ -68,7 +68,7 @@ def test_get_upsell_allows_when_within_cap():
 def test_get_upsell_blocks_would_exceed_cap():
     # sku_001 (1499) + its upsell target sku_003 (349) = 1848 > 1600.
     upsell, blocked = catalog.get_upsell(
-        "sku_001", cart_items=[{"product_id": "sku_001", "qty": 1, "price_inr": 1499}],
+        "demo_merchant", "sku_001", cart_items=[{"product_id": "sku_001", "qty": 1, "price_inr": 1499}],
         exclude_ids={"sku_001"}, max_cart_total_inr=1600,
     )
     assert upsell is None
@@ -76,20 +76,20 @@ def test_get_upsell_blocks_would_exceed_cap():
 
 
 def test_get_upsell_blocks_oos_target():
-    catalog.get_product("sku_003")["stock"] = 0
-    upsell, blocked = catalog.get_upsell("sku_001", cart_items=[], exclude_ids=set())
+    catalog.get_product("demo_merchant", "sku_003")["stock"] = 0
+    upsell, blocked = catalog.get_upsell("demo_merchant", "sku_001", cart_items=[], exclude_ids=set())
     assert upsell is None
     assert blocked == {"product_id": "sku_003", "reason": "oos"}
 
 
 def test_get_upsell_blocks_already_in_cart():
-    upsell, blocked = catalog.get_upsell("sku_001", cart_items=[], exclude_ids={"sku_003"})
+    upsell, blocked = catalog.get_upsell("demo_merchant", "sku_001", cart_items=[], exclude_ids={"sku_003"})
     assert upsell is None
     assert blocked == {"product_id": "sku_003", "reason": "already_in_cart"}
 
 
 def test_get_upsell_no_mapping_is_not_a_block():
-    upsell, blocked = catalog.get_upsell("sku_does_not_exist", cart_items=[], exclude_ids=set())
+    upsell, blocked = catalog.get_upsell("demo_merchant", "sku_does_not_exist", cart_items=[], exclude_ids=set())
     assert upsell is None
     assert blocked is None
 
@@ -97,7 +97,7 @@ def test_get_upsell_no_mapping_is_not_a_block():
 def test_get_upsell_falls_back_to_static_reason_when_llm_key_absent():
     # conftest forces GROQ_API_KEY="" -- upsell_copy.generate_reason()
     # must fall back to the fixed UPSELL_MAP string, not raise or block.
-    upsell, blocked = catalog.get_upsell("sku_001", cart_items=[], exclude_ids=set(), max_cart_total_inr=5000)
+    upsell, blocked = catalog.get_upsell("demo_merchant", "sku_001", cart_items=[], exclude_ids=set(), max_cart_total_inr=5000)
     assert blocked is None
     assert upsell["reason"] == "Frequently bought with Wireless Earbuds Pro -- stay hydrated on the go."
 
@@ -154,14 +154,14 @@ def test_upsell_blocked_by_human_max_order(client):
 
 def test_nlu_no_api_key_always_falls_back():
     # conftest forces GROQ_API_KEY="" for the whole test session.
-    plan = nlu.parse_turn("add the bottle and the earbuds")
+    plan = nlu.parse_turn("demo_merchant", "add the bottle and the earbuds")
     assert plan == {"tool": "clarify", "message": nlu.FALLBACK_MESSAGE}
 
 
 def test_nlu_strips_banned_price_and_decision_fields(monkeypatch):
     monkeypatch.setattr(nlu, "GROQ_API_KEY", "fake_key_for_test")
-    monkeypatch.setattr(nlu, "_call_groq", lambda text: {"tool": "checkout", "amount_inr": 999, "allow": True})
-    plan = nlu.parse_turn("pay now")
+    monkeypatch.setattr(nlu, "_call_groq", lambda merchant_id, text: {"tool": "checkout", "amount_inr": 999, "allow": True})
+    plan = nlu.parse_turn("demo_merchant", "pay now")
     assert plan["tool"] == "checkout"
     assert "amount_inr" not in plan
     assert "allow" not in plan
@@ -169,26 +169,26 @@ def test_nlu_strips_banned_price_and_decision_fields(monkeypatch):
 
 def test_nlu_rejects_tool_outside_allowed_set(monkeypatch):
     monkeypatch.setattr(nlu, "GROQ_API_KEY", "fake_key_for_test")
-    monkeypatch.setattr(nlu, "_call_groq", lambda text: {"tool": "issue_refund"})
-    plan = nlu.parse_turn("give me a refund")
+    monkeypatch.setattr(nlu, "_call_groq", lambda merchant_id, text: {"tool": "issue_refund"})
+    plan = nlu.parse_turn("demo_merchant", "give me a refund")
     assert plan["tool"] == "clarify"
 
 
 def test_nlu_add_filters_out_invalid_product_ids(monkeypatch):
     monkeypatch.setattr(nlu, "GROQ_API_KEY", "fake_key_for_test")
-    monkeypatch.setattr(nlu, "_call_groq", lambda text: {
+    monkeypatch.setattr(nlu, "_call_groq", lambda merchant_id, text: {
         "tool": "add",
         "items": [{"product_id": "sku_003", "qty": 1}, {"product_id": "not_a_real_sku", "qty": 1}],
     })
-    plan = nlu.parse_turn("add the bottle and something made up")
+    plan = nlu.parse_turn("demo_merchant", "add the bottle and something made up")
     assert plan["tool"] == "add"
     assert plan["items"] == [{"product_id": "sku_003", "qty": 1}]
 
 
 def test_nlu_add_with_no_valid_items_falls_back(monkeypatch):
     monkeypatch.setattr(nlu, "GROQ_API_KEY", "fake_key_for_test")
-    monkeypatch.setattr(nlu, "_call_groq", lambda text: {"tool": "add", "items": [{"product_id": "not_real"}]})
-    plan = nlu.parse_turn("add the thingamajig")
+    monkeypatch.setattr(nlu, "_call_groq", lambda merchant_id, text: {"tool": "add", "items": [{"product_id": "not_real"}]})
+    plan = nlu.parse_turn("demo_merchant", "add the thingamajig")
     assert plan["tool"] == "clarify"
 
 
@@ -197,8 +197,8 @@ def test_nlu_browse_price_ceiling_comes_from_raw_text_regex_not_llm(monkeypatch)
     # LLM deliberately returns no price info -- the ceiling below must
     # still show up, proving it came from THIS module's regex over the
     # raw text, never from the model's own output.
-    monkeypatch.setattr(nlu, "_call_groq", lambda text: {"tool": "browse", "category": None})
-    plan = nlu.parse_turn("got anything for gym under 400")
+    monkeypatch.setattr(nlu, "_call_groq", lambda merchant_id, text: {"tool": "browse", "category": None})
+    plan = nlu.parse_turn("demo_merchant", "got anything for gym under 400")
     assert plan["tool"] == "browse"
     assert plan["price_ceiling_inr"] == 400.0
 
@@ -228,14 +228,14 @@ def test_nlu_strips_think_block_before_parsing_json(monkeypatch):
             }}]}
 
     monkeypatch.setattr(nlu.requests, "post", lambda *a, **k: _FakeResp())
-    plan = nlu.parse_turn("I'd like to complete my purchase now")
+    plan = nlu.parse_turn("demo_merchant", "I'd like to complete my purchase now")
     assert plan["tool"] == "checkout"
 
 
 def test_nlu_browse_rejects_invalid_category(monkeypatch):
     monkeypatch.setattr(nlu, "GROQ_API_KEY", "fake_key_for_test")
-    monkeypatch.setattr(nlu, "_call_groq", lambda text: {"tool": "browse", "category": "not_a_real_category"})
-    plan = nlu.parse_turn("show me stuff")
+    monkeypatch.setattr(nlu, "_call_groq", lambda merchant_id, text: {"tool": "browse", "category": "not_a_real_category"})
+    plan = nlu.parse_turn("demo_merchant", "show me stuff")
     assert plan["category"] is None
 
 
@@ -247,7 +247,7 @@ def test_nlu_browse_rejects_invalid_category(monkeypatch):
 def test_nlu_turn_add_plan_shows_real_upsell(client, monkeypatch):
     session_id = make_human_session(client)
     monkeypatch.setattr(nlu, "GROQ_API_KEY", "fake_key_for_test")
-    monkeypatch.setattr(nlu, "_call_groq", lambda text: {
+    monkeypatch.setattr(nlu, "_call_groq", lambda merchant_id, text: {
         "tool": "add", "items": [{"product_id": "sku_001", "qty": 1}],
     })
     resp = client.post("/nlu/turn", json={"session_id": session_id, "text": "add the earbuds"})
@@ -265,7 +265,7 @@ def test_nlu_turn_add_multiple_items_one_turn(monkeypatch, client):
     two items added via the same add_to_cart() function twice."""
     session_id = make_human_session(client)
     monkeypatch.setattr(nlu, "GROQ_API_KEY", "fake_key_for_test")
-    monkeypatch.setattr(nlu, "_call_groq", lambda text: {
+    monkeypatch.setattr(nlu, "_call_groq", lambda merchant_id, text: {
         "tool": "add", "items": [{"product_id": "sku_003", "qty": 1}, {"product_id": "sku_001", "qty": 1}],
     })
     resp = client.post("/nlu/turn", json={"session_id": session_id, "text": "add the bottle and the earbuds"})
@@ -282,7 +282,7 @@ def test_nlu_turn_checkout_plan_goes_through_real_checkout_and_gate(client, monk
     client.post("/cart/add", json={"session_id": session_id, "product_id": "sku_001", "qty": 1})
     # Deliberately no GET /cart -- cart_not_reviewed should still block.
     monkeypatch.setattr(nlu, "GROQ_API_KEY", "fake_key_for_test")
-    monkeypatch.setattr(nlu, "_call_groq", lambda text: {"tool": "checkout"})
+    monkeypatch.setattr(nlu, "_call_groq", lambda merchant_id, text: {"tool": "checkout"})
 
     blocked_resp = client.post("/nlu/turn", json={"session_id": session_id, "text": "pay"})
     assert blocked_resp.status_code == 200  # /nlu/turn itself always 200s -- errors come back as a reply
@@ -298,7 +298,7 @@ def test_nlu_turn_checkout_plan_goes_through_real_checkout_and_gate(client, monk
 def test_nlu_turn_agent_session_cannot_checkout_via_chat(client, monkeypatch):
     session_id = agent_session_id(client)
     monkeypatch.setattr(nlu, "GROQ_API_KEY", "fake_key_for_test")
-    monkeypatch.setattr(nlu, "_call_groq", lambda text: {"tool": "checkout"})
+    monkeypatch.setattr(nlu, "_call_groq", lambda merchant_id, text: {"tool": "checkout"})
     resp = client.post("/nlu/turn", json={"session_id": session_id, "text": "pay"})
     assert resp.status_code == 200
     assert resp.json()["tool"] == "clarify"
@@ -311,7 +311,7 @@ def test_nlu_turn_remove_intent_removes_the_item(client, monkeypatch):
     session_id = make_human_session(client)
     client.post("/cart/add", json={"session_id": session_id, "product_id": "sku_001", "qty": 1})
     monkeypatch.setattr(nlu, "GROQ_API_KEY", "fake_key_for_test")
-    monkeypatch.setattr(nlu, "_call_groq", lambda text: {
+    monkeypatch.setattr(nlu, "_call_groq", lambda merchant_id, text: {
         "tool": "remove", "items": [{"product_id": "sku_001"}],
     })
     resp = client.post("/nlu/turn", json={"session_id": session_id, "text": "that's too much, remove the earbuds"})
@@ -334,10 +334,10 @@ def test_nlu_turn_requires_valid_session(client):
 def test_fast_path_matches_never_call_groq(monkeypatch):
     calls = []
     monkeypatch.setattr(nlu, "GROQ_API_KEY", "fake_key_for_test")
-    monkeypatch.setattr(nlu, "_call_groq", lambda text: calls.append(text) or {"tool": "clarify"})
+    monkeypatch.setattr(nlu, "_call_groq", lambda merchant_id, text: calls.append(text) or {"tool": "clarify"})
 
     for text in ("pay", "checkout", "cart", "my cart", "catalog", "browse"):
-        plan = nlu.parse_turn(text)
+        plan = nlu.parse_turn("demo_merchant", text)
         assert plan["tool"] in ("checkout", "view_cart", "browse")
     assert calls == []  # Groq never touched for any of these
 
@@ -345,8 +345,8 @@ def test_fast_path_matches_never_call_groq(monkeypatch):
 def test_fast_path_does_not_intercept_ambiguous_text(monkeypatch):
     monkeypatch.setattr(nlu, "GROQ_API_KEY", "fake_key_for_test")
     called = []
-    monkeypatch.setattr(nlu, "_call_groq", lambda text: called.append(text) or {"tool": "clarify"})
-    nlu.parse_turn("got anything for gym under 400")
+    monkeypatch.setattr(nlu, "_call_groq", lambda merchant_id, text: called.append(text) or {"tool": "clarify"})
+    nlu.parse_turn("demo_merchant", "got anything for gym under 400")
     assert called == ["got anything for gym under 400"]
 
 
@@ -396,14 +396,14 @@ def test_pending_spend_today_counts_orders_stuck_mid_flight():
 
     order_id = orders_module.new_order_id()
     orders_module.create_order(
-        order_id, "some_session", "ai_agent_mcp",
+        order_id, "demo_merchant", "some_session", "ai_agent_mcp",
         [{"product_id": "sku_001", "qty": 1, "price_inr": 1499}],
         1499.0, "idem-key-1", {"order_id": order_id}, razorpay_order_id="order_stuck_mid_flight",
     )
     # Order is left in "created" status -- simulates a process crash
     # between order-creation and self-capture.
-    assert orders_module.pending_spend_today("ai_agent_mcp") == 1499.0
-    assert orders_module.pending_spend_today("human_whatsapp") == 0.0
+    assert orders_module.pending_spend_today("demo_merchant", "ai_agent_mcp") == 1499.0
+    assert orders_module.pending_spend_today("demo_merchant", "human_whatsapp") == 0.0
 
 
 def test_stuck_order_counts_toward_daily_cap_at_next_pay_attempt(client):
@@ -417,7 +417,7 @@ def test_stuck_order_counts_toward_daily_cap_at_next_pay_attempt(client):
     # though it was never captured.
     stuck_id = orders_module.new_order_id()
     orders_module.create_order(
-        stuck_id, "some_other_session", "ai_agent_mcp",
+        stuck_id, "demo_merchant", "some_other_session", "ai_agent_mcp",
         [{"product_id": "sku_001", "qty": 1, "price_inr": 1499}],
         1499.0, "stuck-idem-key", {"order_id": stuck_id}, razorpay_order_id="order_stuck",
     )

@@ -317,6 +317,54 @@ pages). Auto-refreshing every 5s, same as the audit dashboard, it shows:
 - Conversion Rate (overall and split by actor)
 - Upsell Acceptance Rate
 
+## 8. Bonus: multi-tenancy (optional, if there's time)
+
+Everything above ran against `demo_merchant`. A second, unrelated
+merchant (`fit_supply_co` -- gym equipment) is registered too, proving
+the tenant boundary is real, not just one merchant behind a config
+flag:
+```bash
+curl http://127.0.0.1:8123/merchants
+curl http://127.0.0.1:8123/merchants/fit_supply_co/catalog
+```
+Point out: `fit_supply_co`'s `sku_001` is a completely different
+product ("Adjustable Dumbbell Set") from `demo_merchant`'s `sku_001`
+("Wireless Earbuds Pro") -- every lookup is scoped by
+`(merchant_id, product_id)` together, never just the SKU string.
+
+Mint an agent session there the same way as section 4, but against the
+merchant-scoped endpoint and signed with `FIT_SUPPLY_WARRANT_SECRET`:
+```bash
+cd backend
+python -c "
+import time, uuid, requests
+from app.sessions import sign_warrant
+from app import merchants
+warrant = {
+    'agent_id': 'fit_demo_agent', 'merchant_id': 'fit_supply_co',
+    'per_tx_cap_inr': 8000, 'daily_cap_inr': 10000,
+    'allowed_categories': ['equipment', 'supplements'],
+    'expires_at': time.time() + 3600, 'nonce': uuid.uuid4().hex,
+}
+sig = sign_warrant(warrant, secret=merchants.get_warrant_secret('fit_supply_co'))
+resp = requests.post('http://127.0.0.1:8123/merchants/fit_supply_co/session/agent',
+                      json={'warrant': warrant, 'signature': sig})
+print(resp.json())
+"
+```
+Copy the printed `session_id` into `$FIT_SESSION`, then buy the
+dumbbells (`sku_001` at THIS merchant) exactly like any other agent
+purchase:
+```bash
+curl -X POST http://127.0.0.1:8123/cart/add -H "Content-Type: application/json" -d "{\"session_id\":\"$FIT_SESSION\",\"product_id\":\"sku_001\",\"qty\":1}"
+curl http://127.0.0.1:8123/cart/$FIT_SESSION
+curl -X POST http://127.0.0.1:8123/agent/pay -H "Content-Type: application/json" -d "{\"session_id\":\"$FIT_SESSION\",\"idempotency_key\":\"demo-mt-1\",\"confirm\":true}"
+```
+Expect: `"status":"captured"`, real Razorpay order id, and a live
+Groq upsell suggesting the Yoga Mat -- same policy engine, same
+capture path, completely separate merchant and daily cap from
+everything in sections 1-7.
+
 Point out: every number on this page comes from `GET /metrics`, which
 reads straight off the same audit trail shown in step 5 -- there is no
 separate metrics log, just a live aggregation over data the system was

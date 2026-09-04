@@ -1,11 +1,18 @@
 """
 Session store -- the server-side source of truth for "who is this
-buyer". Replaces the old pattern of trusting a client-supplied `actor`
-field in the request body (a client could simply claim
-actor="human_whatsapp" and dodge every AI-agent guardrail). The actor
-is now fixed at session-creation time and looked up from here on every
-subsequent cart/checkout call -- it is never read from a request body
-again.
+buyer, at which merchant". Replaces the old pattern of trusting a
+client-supplied `actor` field in the request body (a client could
+simply claim actor="human_whatsapp" and dodge every AI-agent
+guardrail). The actor AND merchant are fixed at session-creation time
+and looked up from here on every subsequent cart/checkout call -- they
+are never read from a request body again.
+
+Multi-tenant: every session belongs to exactly one merchant
+(merchants.py). An agent session's warrant is verified against THAT
+merchant's own warrant secret (merchants.get_warrant_secret), not a
+single global one -- a warrant signed for one merchant can never mint
+a session against a different one, even if an attacker somehow learned
+another merchant's id.
 
 Persisted in SQLite (sessions.db, alongside audit_trail.db) rather than
 an in-memory dict -- a backend restart (a redeploy, a crash) no longer
@@ -15,17 +22,18 @@ audit.py), with a busy_timeout so concurrent requests wait for the
 SQLite writer lock briefly instead of raising immediately.
 
 Two ways to get a session:
-  - POST /session/human -- no proof required; a human is already the
-    accountable party, so there's nothing to authorize beyond "you are
-    a person using the web chat".
-  - POST /session/agent -- requires a spending warrant signed with
-    AGENT_WARRANT_SECRET (HMAC-SHA256 over the warrant's canonical
-    JSON). The warrant is what actually grants an AI agent the right
-    to spend money on this merchant's behalf, and carries its own
-    per-transaction / daily caps and allowed product categories --
-    guardrails.py reads those from the session's warrant, not from a
-    global constant, so a warrant-less agent session cannot exist and
-    there is no permissive fallback.
+  - POST /merchants/{merchant_id}/session/human -- no proof required;
+    a human is already the accountable party, so there's nothing to
+    authorize beyond "you are a person using the web chat".
+  - POST /merchants/{merchant_id}/session/agent -- requires a spending
+    warrant signed with that merchant's own warrant secret
+    (HMAC-SHA256 over the warrant's canonical JSON). The warrant is
+    what actually grants an AI agent the right to spend money on this
+    merchant's behalf, and carries its own per-transaction / daily
+    caps and allowed product categories -- policy.py reads those from
+    the session's warrant, not from a global constant, so a
+    warrant-less agent session cannot exist and there is no permissive
+    fallback.
 """
 
 import hashlib
@@ -39,9 +47,15 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from . import merchants
+
 # .env lives at the project root, one level above backend/.
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
+# Kept for backward compatibility with any caller still importing this
+# directly (e.g. a script signing a demo_merchant warrant by hand) --
+# merchants.get_warrant_secret(merchant_id) is the actual source of
+# truth used by _verify_warrant() below.
 AGENT_WARRANT_SECRET = os.environ.get("AGENT_WARRANT_SECRET", "")
 MERCHANT_ID = os.environ.get("MERCHANT_ID", "demo_merchant")
 
@@ -63,6 +77,7 @@ def _get_conn():
         """
         CREATE TABLE IF NOT EXISTS sessions (
             session_id TEXT PRIMARY KEY,
+            merchant_id TEXT NOT NULL,
             actor TEXT NOT NULL,
             warrant TEXT,             -- JSON, NULL for human sessions
             warrant_signature TEXT,   -- NULL for human sessions
@@ -92,7 +107,12 @@ def canonical_json(obj: dict) -> str:
 
 
 def sign_warrant(warrant: dict, secret: str | None = None) -> str:
-    secret = AGENT_WARRANT_SECRET if secret is None else secret
+    """secret defaults to the demo_merchant secret for backward
+    compatibility with existing callers/tests that don't pass one
+    explicitly; multi-merchant callers should pass
+    merchants.get_warrant_secret(merchant_id) explicitly."""
+    if secret is None:
+        secret = merchants.get_warrant_secret(warrant.get("merchant_id", "demo_merchant")) or AGENT_WARRANT_SECRET
     return hmac.new(secret.encode("utf-8"), canonical_json(warrant).encode("utf-8"), hashlib.sha256).hexdigest()
 
 
@@ -100,7 +120,9 @@ def consume_nonce(nonce: str | None) -> bool:
     """True (and marks it used) the first time a nonce is seen. False on
     a replay or a missing nonce. A single INSERT OR IGNORE is atomic at
     the SQLite engine level -- two concurrent callers racing the same
-    nonce can't both "win"."""
+    nonce can't both "win". One pool shared across all merchants -- a
+    nonce is a one-time-use random token regardless of which merchant
+    it was issued for, so there's no need to partition it."""
     if not nonce:
         return False
     conn = _get_conn()
@@ -113,15 +135,21 @@ def consume_nonce(nonce: str | None) -> bool:
         conn.close()
 
 
-def _verify_warrant(warrant: dict, signature: str):
-    if not AGENT_WARRANT_SECRET:
+def _verify_warrant(merchant_id: str, warrant: dict, signature: str):
+    merchant = merchants.get_merchant(merchant_id)
+    if not merchant:
+        raise WarrantInvalid("unknown_merchant")
+
+    secret = merchants.get_warrant_secret(merchant_id)
+    if not secret:
         raise WarrantInvalid("agent_warrant_secret_not_configured")
+
     missing = [f for f in REQUIRED_WARRANT_FIELDS if f not in warrant]
     if missing:
         raise WarrantInvalid(f"warrant_missing_fields: {','.join(missing)}")
-    if not hmac.compare_digest(sign_warrant(warrant), signature or ""):
+    if not hmac.compare_digest(sign_warrant(warrant, secret=secret), signature or ""):
         raise WarrantInvalid("signature_mismatch")
-    if warrant["merchant_id"] != MERCHANT_ID:
+    if warrant["merchant_id"] != merchant_id:
         raise WarrantInvalid("merchant_id_mismatch")
     if warrant["expires_at"] < time.time():
         raise WarrantInvalid("warrant_expired")
@@ -129,13 +157,14 @@ def _verify_warrant(warrant: dict, signature: str):
         raise WarrantInvalid("nonce_reused_or_missing")
 
 
-def create_human_session() -> str:
+def create_human_session(merchant_id: str) -> str:
     session_id = f"human_{uuid.uuid4().hex[:12]}"
     conn = _get_conn()
     try:
         conn.execute(
-            "INSERT INTO sessions (session_id, actor, warrant, warrant_signature, created_at) VALUES (?, ?, ?, ?, ?)",
-            (session_id, HUMAN_ACTOR, None, None, time.time()),
+            "INSERT INTO sessions (session_id, merchant_id, actor, warrant, warrant_signature, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, merchant_id, HUMAN_ACTOR, None, None, time.time()),
         )
         conn.commit()
     finally:
@@ -143,19 +172,20 @@ def create_human_session() -> str:
     return session_id
 
 
-def create_agent_session(warrant: dict, signature: str) -> str:
+def create_agent_session(merchant_id: str, warrant: dict, signature: str) -> str:
     """Raises WarrantInvalid on any failure -- caller maps that to a 401.
     The signature is stored alongside the warrant so policy.py can
     re-verify BOTH at payment time, not just at session-mint time --
     a warrant valid when the session was created may have since
     expired by the time the agent actually calls POST /agent/pay."""
-    _verify_warrant(warrant, signature)
+    _verify_warrant(merchant_id, warrant, signature)
     session_id = f"agent_{uuid.uuid4().hex[:12]}"
     conn = _get_conn()
     try:
         conn.execute(
-            "INSERT INTO sessions (session_id, actor, warrant, warrant_signature, created_at) VALUES (?, ?, ?, ?, ?)",
-            (session_id, AGENT_ACTOR, json.dumps(warrant), signature, time.time()),
+            "INSERT INTO sessions (session_id, merchant_id, actor, warrant, warrant_signature, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, merchant_id, AGENT_ACTOR, json.dumps(warrant), signature, time.time()),
         )
         conn.commit()
     finally:
@@ -167,15 +197,16 @@ def get_session(session_id: str) -> dict | None:
     conn = _get_conn()
     try:
         row = conn.execute(
-            "SELECT actor, warrant, warrant_signature, created_at FROM sessions WHERE session_id = ?",
+            "SELECT merchant_id, actor, warrant, warrant_signature, created_at FROM sessions WHERE session_id = ?",
             (session_id,),
         ).fetchone()
     finally:
         conn.close()
     if not row:
         return None
-    actor, warrant_json, warrant_signature, created_at = row
+    merchant_id, actor, warrant_json, warrant_signature, created_at = row
     return {
+        "merchant_id": merchant_id,
         "actor": actor,
         "warrant": json.loads(warrant_json) if warrant_json else None,
         "warrant_signature": warrant_signature,

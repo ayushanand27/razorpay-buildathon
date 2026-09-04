@@ -53,14 +53,14 @@ def capture_human_order(client, payment_link_id, amount_inr):
 def test_refund_agent_order_restores_stock_and_metrics(client):
     session_id = agent_session_id(client)
     add_and_review(client, session_id, "sku_001", qty=1)
-    starting_stock = catalog.get_product("sku_001")["stock"]
+    starting_stock = catalog.get_product("demo_merchant", "sku_001")["stock"]
 
     pay_resp = client.post("/agent/pay", json={
         "session_id": session_id, "idempotency_key": "refund-test-1", "confirm": True,
     })
     assert pay_resp.status_code == 200
     order_id = pay_resp.json()["order_id"]
-    assert catalog.get_product("sku_001")["stock"] == starting_stock - 1
+    assert catalog.get_product("demo_merchant", "sku_001")["stock"] == starting_stock - 1
 
     metrics = client.get("/metrics").json()
     assert metrics["captured_inr"] == 1499.0
@@ -71,7 +71,7 @@ def test_refund_agent_order_restores_stock_and_metrics(client):
     assert refund_resp.status_code == 200
     assert refund_resp.json()["status"] == "refunded"
 
-    assert catalog.get_product("sku_001")["stock"] == starting_stock  # restored
+    assert catalog.get_product("demo_merchant", "sku_001")["stock"] == starting_stock  # restored
 
     metrics = client.get("/metrics").json()
     assert metrics["captured_inr"] == 1499.0  # gross captured stays historically accurate
@@ -130,17 +130,17 @@ def test_refund_is_idempotent(client):
         "session_id": session_id, "idempotency_key": "refund-idempotent", "confirm": True,
     })
     order_id = pay_resp.json()["order_id"]
-    starting_stock = catalog.get_product("sku_001")["stock"]
+    starting_stock = catalog.get_product("demo_merchant", "sku_001")["stock"]
 
     first = client.post("/refund", json={"session_id": session_id, "order_id": order_id})
     assert first.status_code == 200
-    stock_after_first = catalog.get_product("sku_001")["stock"]
+    stock_after_first = catalog.get_product("demo_merchant", "sku_001")["stock"]
 
     second = client.post("/refund", json={"session_id": session_id, "order_id": order_id})
     assert second.status_code == 200
 
     # Stock restored exactly once, not twice.
-    assert catalog.get_product("sku_001")["stock"] == stock_after_first == starting_stock + 1
+    assert catalog.get_product("demo_merchant", "sku_001")["stock"] == stock_after_first == starting_stock + 1
 
 
 def test_refund_missing_order_404(client):

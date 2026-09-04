@@ -50,6 +50,7 @@ def _get_conn():
         """
         CREATE TABLE IF NOT EXISTS orders (
             order_id TEXT PRIMARY KEY,
+            merchant_id TEXT NOT NULL,
             session_id TEXT NOT NULL,
             actor TEXT NOT NULL,
             line_items TEXT NOT NULL,      -- JSON list
@@ -78,10 +79,11 @@ def _get_conn():
 
 
 def _row_to_order(row) -> dict:
-    (order_id, session_id, actor, line_items_json, total_inr, idempotency_key,
+    (order_id, merchant_id, session_id, actor, line_items_json, total_inr, idempotency_key,
      payment_link_id, razorpay_order_id, response_json, status, payment_id, created_at) = row
     return {
         "order_id": order_id,
+        "merchant_id": merchant_id,
         "session_id": session_id,
         "actor": actor,
         "line_items": json.loads(line_items_json),
@@ -96,7 +98,7 @@ def _row_to_order(row) -> dict:
     }
 
 
-_ORDER_COLUMNS = ("order_id, session_id, actor, line_items, total_inr, idempotency_key, "
+_ORDER_COLUMNS = ("order_id, merchant_id, session_id, actor, line_items, total_inr, idempotency_key, "
                   "payment_link_id, razorpay_order_id, response, status, payment_id, created_at")
 
 
@@ -104,14 +106,14 @@ def new_order_id() -> str:
     return f"order_{uuid.uuid4().hex[:12]}"
 
 
-def create_order(order_id: str, session_id: str, actor: str, line_items: list[dict],
+def create_order(order_id: str, merchant_id: str, session_id: str, actor: str, line_items: list[dict],
                   total_inr: float, idempotency_key: str, response: dict,
                   payment_link_id: str | None = None, razorpay_order_id: str | None = None):
     conn = _get_conn()
     try:
         conn.execute(
-            f"INSERT INTO orders ({_ORDER_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (order_id, session_id, actor, json.dumps([dict(li) for li in line_items]), total_inr,
+            f"INSERT INTO orders ({_ORDER_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (order_id, merchant_id, session_id, actor, json.dumps([dict(li) for li in line_items]), total_inr,
              idempotency_key, payment_link_id, razorpay_order_id, json.dumps(response),
              "created", None, time.time()),
         )
@@ -213,11 +215,11 @@ def capture_order(order_id: str, payment_id: str | None = None) -> tuple[bool, s
 
         decremented = []
         for li in order["line_items"]:
-            if catalog.decrement_stock(li["product_id"], li["qty"]):
+            if catalog.decrement_stock(order["merchant_id"], li["product_id"], li["qty"]):
                 decremented.append((li["product_id"], li["qty"]))
             else:
                 for pid, qty in decremented:
-                    catalog.restore_stock(pid, qty)
+                    catalog.restore_stock(order["merchant_id"], pid, qty)
                 _set_status(order_id, "capture_failed")
                 return False, "insufficient_stock_at_capture"
 
@@ -240,27 +242,29 @@ def refund_order(order_id: str) -> tuple[bool, str | None]:
             return False, "order_not_captured"
 
         for li in order["line_items"]:
-            catalog.restore_stock(li["product_id"], li["qty"])
+            catalog.restore_stock(order["merchant_id"], li["product_id"], li["qty"])
         _set_status(order_id, "refunded")
         return True, None
 
 
-def pending_spend_today(actor: str) -> float:
-    """Sum of this actor's orders still sitting in 'created' status
-    (payment initiated but not yet captured OR failed) from today --
-    closes the gap where the daily cap only counted CAPTURED spend
-    (see audit.captured_spend_today). In today's architecture
-    POST /agent/pay always attempts self-capture synchronously in the
-    same request, so an order only lingers in 'created' if the process
-    crashed between creating it and capturing it -- a rare but real
-    case this still needs to count against the cap, not silently drop
-    out of it."""
+def pending_spend_today(merchant_id: str, actor: str) -> float:
+    """Sum of this actor's orders AT THIS MERCHANT still sitting in
+    'created' status (payment initiated but not yet captured OR
+    failed) from today -- closes the gap where the daily cap only
+    counted CAPTURED spend (see audit.captured_spend_today). In
+    today's architecture POST /agent/pay always attempts self-capture
+    synchronously in the same request, so an order only lingers in
+    'created' if the process crashed between creating it and capturing
+    it -- a rare but real case this still needs to count against the
+    cap, not silently drop out of it. Scoped by merchant_id because a
+    warrant's daily cap is itself per-(agent, merchant) -- spend
+    pending at one merchant must never affect a cap at another."""
     today = datetime.date.today()
     conn = _get_conn()
     try:
         rows = conn.execute(
-            "SELECT total_inr, created_at FROM orders WHERE actor = ? AND status = 'created'",
-            (actor,),
+            "SELECT total_inr, created_at FROM orders WHERE merchant_id = ? AND actor = ? AND status = 'created'",
+            (merchant_id, actor),
         ).fetchall()
     finally:
         conn.close()

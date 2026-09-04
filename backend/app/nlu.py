@@ -101,14 +101,14 @@ def _extract_price_ceiling(text: str) -> float | None:
     return float(m.group(1)) if m else None
 
 
-def _catalog_summary() -> str:
+def _catalog_summary(merchant_id: str) -> str:
     return "\n".join(
         f"{p['id']}: {p['name']} ({p['category']}) -- {p['availability']}"
-        for p in catalog.list_products()
+        for p in catalog.list_products(merchant_id)
     )
 
 
-def _build_prompt(text: str) -> str:
+def _build_prompt(merchant_id: str, text: str) -> str:
     return (
         "You are a strict intent classifier for a shopping chat -- not a shopping "
         "assistant, not a pricing engine. Pick EXACTLY ONE tool from this fixed list: "
@@ -116,7 +116,7 @@ def _build_prompt(text: str) -> str:
         "this list. Never include a price or money amount in your response. Never decide "
         "whether a purchase is allowed -- that is not your job and is checked "
         "elsewhere.\n\n"
-        f"Catalog (id: name (category) -- availability):\n{_catalog_summary()}\n\n"
+        f"Catalog (id: name (category) -- availability):\n{_catalog_summary(merchant_id)}\n\n"
         "Respond with ONLY a compact JSON object, no other text, no markdown fence:\n"
         '- browse: {"tool":"browse","category":"<one of electronics|apparel|home|stationery, or null>"} '
         "(use this whenever the user is asking what's available, browsing, or filtering by "
@@ -144,7 +144,7 @@ def _build_prompt(text: str) -> str:
     )
 
 
-def _post_groq(key: str, text: str):
+def _post_groq(key: str, merchant_id: str, text: str):
     return requests.post(
         GROQ_API_URL,
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -152,15 +152,15 @@ def _post_groq(key: str, text: str):
             "model": GROQ_MODEL,
             "max_tokens": MAX_TOKENS,
             "temperature": 0,
-            "messages": [{"role": "user", "content": _build_prompt(text)}],
+            "messages": [{"role": "user", "content": _build_prompt(merchant_id, text)}],
         },
         timeout=REQUEST_TIMEOUT_SECONDS,
     )
 
 
-def _call_groq(text: str) -> dict | None:
+def _call_groq(merchant_id: str, text: str) -> dict | None:
     try:
-        resp = groq_keys.post_with_rotation(_post_groq, GROQ_API_KEY, text)
+        resp = groq_keys.post_with_rotation(_post_groq, GROQ_API_KEY, merchant_id, text)
         if resp is None:
             return None
         resp.raise_for_status()
@@ -184,9 +184,11 @@ def _call_groq(text: str) -> dict | None:
         return None
 
 
-def parse_turn(text: str) -> dict:
+def parse_turn(merchant_id: str, text: str) -> dict:
     """Returns a plan dict with a 'tool' key always in ALLOWED_TOOLS.
-    Never includes a price, amount, or allow/confirm field."""
+    Never includes a price, amount, or allow/confirm field. Scoped to
+    merchant_id -- the catalog summary in the prompt, and the
+    product_id validation below, only ever see THIS merchant's SKUs."""
     fast = _try_fast_path(text)
     if fast:
         return fast
@@ -194,7 +196,7 @@ def parse_turn(text: str) -> dict:
     if not GROQ_API_KEY:
         return _fallback()
 
-    plan = _call_groq(text)
+    plan = _call_groq(merchant_id, text)
     if not plan or plan.get("tool") not in ALLOWED_TOOLS:
         return _fallback()
 
@@ -209,7 +211,7 @@ def parse_turn(text: str) -> dict:
                 if not isinstance(item, dict):
                     continue
                 pid = item.get("product_id")
-                if pid and catalog.get_product(pid):
+                if pid and catalog.get_product(merchant_id, pid):
                     qty = item.get("qty", 1)
                     valid_items.append({"product_id": pid, "qty": qty if isinstance(qty, int) and qty > 0 else 1})
         if not valid_items:

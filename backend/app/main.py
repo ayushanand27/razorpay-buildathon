@@ -1,5 +1,20 @@
 """
-Merchant backend -- single source of truth.
+Merchant backend -- single source of truth. Multi-tenant: every
+session belongs to exactly one merchant (merchants.py), and every
+catalog/cart/order/policy operation is scoped to that merchant. Two
+merchants can reuse the same SKU id without collision, and an agent
+warrant signed for one merchant can never mint a session against, or
+spend against the cap of, a different one -- see sessions.py and
+policy.py.
+
+New merchant-scoped endpoints:
+  GET  /merchants
+  GET  /merchants/{merchant_id}/catalog
+  POST /merchants/{merchant_id}/session/human
+  POST /merchants/{merchant_id}/session/agent
+The original un-prefixed /catalog, /session/human, /session/agent
+routes still work, as thin aliases for merchant_id="demo_merchant" --
+kept so the existing web chat and MCP server need no changes.
 
 Split payment rails:
   - Human (POST /checkout): Razorpay Payment Links -- a human opens
@@ -26,7 +41,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from . import catalog, cart, payments, audit, metrics, webhooks, sessions, orders, policy, nlu, guardrails
+from . import catalog, cart, payments, audit, metrics, webhooks, sessions, orders, policy, nlu, guardrails, merchants
 from .guardrails import check_checkout_allowed, check_cart_reviewed, GuardrailBlocked
 
 app = FastAPI(title="Agentic Commerce Demo Backend")
@@ -101,62 +116,105 @@ def _require_session(session_id: str) -> dict:
     return session
 
 
-def _agent_spend_today() -> float:
-    """CAPTURED spend today PLUS spend still sitting in orders that are
-    'created' but not yet captured or failed today (see
-    orders.pending_spend_today) -- closes the gap where the daily cap
-    only counted captured money and an order stuck mid-flight (e.g. the
-    process crashed between order-creation and self-capture) could
-    silently dodge it."""
-    return audit.captured_spend_today(sessions.AGENT_ACTOR) + orders.pending_spend_today(sessions.AGENT_ACTOR)
+def _require_merchant(merchant_id: str) -> dict:
+    merchant = merchants.get_merchant(merchant_id)
+    if not merchant:
+        raise HTTPException(404, "unknown_merchant")
+    return merchant
+
+
+def _agent_spend_today(merchant_id: str) -> float:
+    """CAPTURED spend today AT THIS MERCHANT, PLUS spend still sitting
+    in orders that are 'created' but not yet captured or failed today
+    (see orders.pending_spend_today) -- closes the gap where the daily
+    cap only counted captured money and an order stuck mid-flight
+    (e.g. the process crashed between order-creation and self-capture)
+    could silently dodge it. A warrant's daily cap is itself
+    per-(agent, merchant), so both terms are scoped to merchant_id --
+    spend at a different merchant never affects this one's cap."""
+    return (audit.captured_spend_today(merchant_id, sessions.AGENT_ACTOR)
+            + orders.pending_spend_today(merchant_id, sessions.AGENT_ACTOR))
 
 
 def _max_cart_total_for_upsell(session: dict) -> float:
     """The ceiling an upsell suggestion must not push the cart total
     past -- an agent's remaining warrant cap (whichever of per-tx or
-    daily-remaining is tighter), or the merchant's flat MAX_ORDER_INR
+    daily-remaining is tighter), or this merchant's own max_order_inr
     for a human. Used ONLY to decide whether to suggest an add-on, not
     to authorize anything -- the real cap re-check happens again, from
     scratch, at checkout/pay time."""
+    merchant_id = session["merchant_id"]
     if session["actor"] == sessions.AGENT_ACTOR:
         warrant = session["warrant"]
-        daily_remaining = max(warrant["daily_cap_inr"] - _agent_spend_today(), 0.0)
+        daily_remaining = max(warrant["daily_cap_inr"] - _agent_spend_today(merchant_id), 0.0)
         return min(warrant["per_tx_cap_inr"], daily_remaining)
-    return guardrails.MAX_ORDER_INR
+    return merchants.get_max_order_inr(merchant_id)
 
+
+def _list_catalog(merchant_id: str, category: str | None = None) -> list[dict]:
+    return catalog.list_products(merchant_id, category)
+
+
+@app.get("/merchants")
+def list_merchants():
+    return {"merchants": merchants.list_merchants()}
+
+
+@app.get("/merchants/{merchant_id}/catalog")
+def get_merchant_catalog(merchant_id: str, category: str | None = None):
+    _require_merchant(merchant_id)
+    return {"products": _list_catalog(merchant_id, category)}
+
+
+@app.post("/merchants/{merchant_id}/session/human")
+def merchant_session_human(merchant_id: str):
+    _require_merchant(merchant_id)
+    session_id = sessions.create_human_session(merchant_id)
+    return {"session_id": session_id, "actor": sessions.HUMAN_ACTOR, "merchant_id": merchant_id}
+
+
+@app.post("/merchants/{merchant_id}/session/agent")
+def merchant_session_agent(merchant_id: str, req: AgentWarrantRequest):
+    _require_merchant(merchant_id)
+    try:
+        session_id = sessions.create_agent_session(merchant_id, req.warrant, req.signature)
+    except sessions.WarrantInvalid as e:
+        raise HTTPException(401, f"invalid_warrant: {e.reason}")
+    return {"session_id": session_id, "actor": sessions.AGENT_ACTOR, "merchant_id": merchant_id}
+
+
+# ---- Backward-compatible aliases -- default to demo_merchant, so the
+# existing web chat and MCP server (neither of which know merchants
+# exist) keep working unchanged. ----
 
 @app.post("/session/human")
 def session_human():
-    session_id = sessions.create_human_session()
-    return {"session_id": session_id, "actor": sessions.HUMAN_ACTOR}
+    return merchant_session_human("demo_merchant")
 
 
 @app.post("/session/agent")
 def session_agent(req: AgentWarrantRequest):
-    try:
-        session_id = sessions.create_agent_session(req.warrant, req.signature)
-    except sessions.WarrantInvalid as e:
-        raise HTTPException(401, f"invalid_warrant: {e.reason}")
-    return {"session_id": session_id, "actor": sessions.AGENT_ACTOR}
+    return merchant_session_agent("demo_merchant", req)
 
 
 @app.get("/catalog")
 def get_catalog(category: str | None = None):
-    return {"products": catalog.list_products(category)}
+    return {"products": _list_catalog("demo_merchant", category)}
 
 
 @app.post("/cart/add")
 def add_to_cart(req: AddToCartRequest):
     session = _require_session(req.session_id)
     actor = session["actor"]
+    merchant_id = session["merchant_id"]
 
-    product = catalog.get_product(req.product_id)
+    product = catalog.get_product(merchant_id, req.product_id)
     if not product:
         audit.log_action(actor, req.session_id, "add_to_cart", "failed",
                           details={"reason": "product_not_found", "product_id": req.product_id})
         raise HTTPException(404, "product_not_found")
 
-    updated_cart, err = cart.add_to_cart(req.session_id, req.product_id, req.qty)
+    updated_cart, err = cart.add_to_cart(merchant_id, req.session_id, req.product_id, req.qty)
     if err:
         audit.log_action(actor, req.session_id, "add_to_cart", "failed", details={"reason": err})
         raise HTTPException(400, err)
@@ -166,7 +224,7 @@ def add_to_cart(req: AddToCartRequest):
                       details={"product_id": req.product_id, "qty": req.qty})
     cart_product_ids = {li["product_id"] for li in updated_cart}
     max_cart_total_inr = _max_cart_total_for_upsell(session)
-    upsell, blocked = catalog.get_upsell(req.product_id, cart_items=updated_cart,
+    upsell, blocked = catalog.get_upsell(merchant_id, req.product_id, cart_items=updated_cart,
                                           exclude_ids=cart_product_ids,
                                           max_cart_total_inr=max_cart_total_inr)
     if upsell:
@@ -250,22 +308,23 @@ def nlu_turn(req: NluTurnRequest):
     match one of the hardcoded commands. Groq does INTENT CLASSIFICATION
     ONLY -- it picks a tool name (browse | add | remove | view_cart |
     checkout | clarify) and, for `add`/`remove`, which real product_ids
-    are meant; see nlu.py. It never returns a price and never makes an
-    allow/confirm decision. Every tool this endpoint executes is the
-    exact same function the hardcoded chat commands (and /checkout
-    directly) call -- guardrails, idempotency, and the cart-review gate
-    all apply identically; NLU has no way to reach payments.py itself.
+    are meant (scoped to this session's merchant); see nlu.py. It never
+    returns a price and never makes an allow/confirm decision. Every
+    tool this endpoint executes is the exact same function the
+    hardcoded chat commands (and /checkout directly) call -- guardrails,
+    idempotency, and the cart-review gate all apply identically; NLU
+    has no way to reach payments.py itself.
     """
     session = _require_session(req.session_id)
     actor = session["actor"]
+    merchant_id = session["merchant_id"]
 
-    plan = nlu.parse_turn(req.text)
+    plan = nlu.parse_turn(merchant_id, req.text)
     tool = plan["tool"]
 
     try:
         if tool == "browse":
-            data = get_catalog(category=plan.get("category"))
-            products = data["products"]
+            products = _list_catalog(merchant_id, plan.get("category"))
             ceiling = plan.get("price_ceiling_inr")
             if ceiling is not None:
                 products = [p for p in products if p["price_inr"] <= ceiling]
@@ -316,6 +375,7 @@ def checkout(req: CheckoutRequest):
     """
     session = _require_session(req.session_id)
     actor = session["actor"]
+    merchant_id = session["merchant_id"]
     if actor != sessions.HUMAN_ACTOR:
         raise HTTPException(400, "agents must use /agent/pay -- /checkout is the human (Payment Links) rail")
 
@@ -344,7 +404,7 @@ def checkout(req: CheckoutRequest):
                 # cart_not_reviewed checked first -- a workflow precondition,
                 # ahead of the stock check below.
                 check_cart_reviewed(cart.was_cart_reviewed(req.session_id))
-                check_checkout_allowed(line_items)
+                check_checkout_allowed(merchant_id, line_items)
             except GuardrailBlocked as e:
                 audit.log_action(actor, req.session_id, "checkout_attempt", "blocked",
                                   amount_inr=total, details={"reason": e.reason})
@@ -370,7 +430,7 @@ def checkout(req: CheckoutRequest):
             order_id = orders.new_order_id()
             response = {"payment_link": result.get("short_url"), "amount_inr": total,
                         "note": note, "order_id": order_id}
-            orders.create_order(order_id, req.session_id, actor, line_items, total,
+            orders.create_order(order_id, merchant_id, req.session_id, actor, line_items, total,
                                  req.idempotency_key, response, payment_link_id=payment_link_id)
 
             audit.log_action(actor, req.session_id, "checkout_payment", status,
@@ -401,6 +461,7 @@ def agent_pay(req: AgentPayRequest):
     """
     session = _require_session(req.session_id)
     actor = session["actor"]
+    merchant_id = session["merchant_id"]
     if actor != sessions.AGENT_ACTOR:
         raise HTTPException(400, "only agent sessions may use /agent/pay -- humans use /checkout")
 
@@ -423,10 +484,11 @@ def agent_pay(req: AgentPayRequest):
         try:
             warrant = session["warrant"]
             warrant_signature = session["warrant_signature"]
-            spend_today = _agent_spend_today()
+            spend_today = _agent_spend_today(merchant_id)
             cart_reviewed = cart.was_cart_reviewed(req.session_id)
 
-            proposal = policy.build_proposal(warrant, warrant_signature, line_items, spend_today, cart_reviewed)
+            proposal = policy.build_proposal(merchant_id, warrant, warrant_signature, line_items,
+                                              spend_today, cart_reviewed)
             decision = policy.evaluate(proposal)
 
             # "Log the full decision JSON" -- every attempt, allow or
@@ -458,7 +520,7 @@ def agent_pay(req: AgentPayRequest):
             order_id = orders.new_order_id()
             response = {"order_id": order_id, "razorpay_order_id": razorpay_order_id,
                         "amount_inr": total, "status": "pending_capture"}
-            orders.create_order(order_id, req.session_id, actor, line_items, total,
+            orders.create_order(order_id, merchant_id, req.session_id, actor, line_items, total,
                                  req.idempotency_key, response, razorpay_order_id=razorpay_order_id)
 
             audit.log_action(actor, req.session_id, "checkout_payment", "ok", amount_inr=total,
@@ -494,7 +556,7 @@ def agent_remaining_cap(session_id: str):
     if session["actor"] != sessions.AGENT_ACTOR:
         raise HTTPException(400, "remaining-cap only applies to agent sessions")
     warrant = session["warrant"]
-    spend_today = _agent_spend_today()
+    spend_today = _agent_spend_today(session["merchant_id"])
     return {
         "per_tx_cap_inr": warrant["per_tx_cap_inr"],
         "daily_remaining_inr": max(warrant["daily_cap_inr"] - spend_today, 0.0),

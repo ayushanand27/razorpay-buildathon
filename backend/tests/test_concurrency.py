@@ -93,7 +93,7 @@ def test_concurrent_agent_pay_same_idempotency_key_creates_only_one_order(client
     session_id = agent_session_id(client)
     add_and_review(client, session_id, "sku_003", qty=1)
     key = "concurrent-agent-pay-key"
-    starting_stock = catalog.get_product("sku_003")["stock"]
+    starting_stock = catalog.get_product("demo_merchant", "sku_003")["stock"]
 
     responses = _fire_concurrently(
         client, "post", "/agent/pay",
@@ -109,7 +109,7 @@ def test_concurrent_agent_pay_same_idempotency_key_creates_only_one_order(client
 
     # Stock decremented exactly once, not twice -- proves capture_order's
     # own lock also holds even if two callers somehow both reached it.
-    assert catalog.get_product("sku_003")["stock"] == starting_stock - 1
+    assert catalog.get_product("demo_merchant", "sku_003")["stock"] == starting_stock - 1
 
 
 def test_concurrent_requests_different_sessions_both_succeed_independently(client):

@@ -41,6 +41,7 @@ class Decision:
 
 @dataclass
 class Proposal:
+    merchant_id: str
     warrant: dict
     warrant_signature: str
     cart: list[dict]           # server-derived: product_id, qty, name, unit_price_inr, category
@@ -50,16 +51,17 @@ class Proposal:
     now: float = field(default_factory=time.time)
 
 
-def build_proposal(warrant: dict, warrant_signature: str, cart_line_items: list[dict],
+def build_proposal(merchant_id: str, warrant: dict, warrant_signature: str, cart_line_items: list[dict],
                     spend_today_inr: float, cart_reviewed: bool, now: float | None = None) -> Proposal:
     """Builds a proposal from the cart's OWN stored line items (product_id,
     qty, price_inr captured at add-to-cart time) plus a fresh lookup of
-    each product against the live server catalog -- the two are kept
-    separate on purpose so evaluate() can compare them (rule 4)."""
+    each product against the live server catalog, SCOPED TO merchant_id
+    -- the two are kept separate on purpose so evaluate() can compare
+    them (rule 4)."""
     server_cart = []
     proposed_total = 0.0
     for li in cart_line_items:
-        product = catalog.get_product(li["product_id"])
+        product = catalog.get_product(merchant_id, li["product_id"])
         server_cart.append({
             "product_id": li["product_id"],
             "qty": li["qty"],
@@ -70,7 +72,7 @@ def build_proposal(warrant: dict, warrant_signature: str, cart_line_items: list[
         })
         proposed_total += li["qty"] * li.get("price_inr", 0)
     return Proposal(
-        warrant=warrant, warrant_signature=warrant_signature, cart=server_cart,
+        merchant_id=merchant_id, warrant=warrant, warrant_signature=warrant_signature, cart=server_cart,
         proposed_total_inr=proposed_total, spend_today_inr=spend_today_inr,
         cart_reviewed=cart_reviewed, now=now if now is not None else time.time(),
     )
@@ -86,8 +88,12 @@ def evaluate(proposal: Proposal) -> Decision:
     if warrant.get("expires_at", 0) < proposal.now:
         return Decision(False, "warrant_expired", 0.0)
 
-    # 2. merchant_id matches
-    if warrant.get("merchant_id") != sessions_mod.MERCHANT_ID:
+    # 2. merchant_id matches -- the warrant's OWN claimed merchant_id
+    # must match the merchant this session actually belongs to (not a
+    # fixed global constant; sessions.create_agent_session() enforces
+    # this at mint time too, this is the same check re-run at pay time
+    # for defense in depth, same as the signature/expiry checks above).
+    if warrant.get("merchant_id") != proposal.merchant_id:
         return Decision(False, "merchant_id_mismatch", 0.0)
 
     per_tx_cap = warrant["per_tx_cap_inr"]

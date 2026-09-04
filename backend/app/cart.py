@@ -13,7 +13,7 @@ import os
 import sqlite3
 import time
 
-from .catalog import get_product
+from . import catalog
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "carts.db")
 
@@ -75,8 +75,8 @@ def get_cart(session_id: str) -> list[dict]:
     return [{"product_id": r[0], "name": r[1], "qty": r[2], "price_inr": r[3]} for r in rows]
 
 
-def add_to_cart(session_id: str, product_id: str, qty: int = 1):
-    product = get_product(product_id)
+def add_to_cart(merchant_id: str, session_id: str, product_id: str, qty: int = 1):
+    product = catalog.get_product(merchant_id, product_id)
     if not product:
         return None, "product_not_found"
 

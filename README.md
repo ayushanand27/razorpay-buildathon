@@ -95,11 +95,12 @@ pip install -r requirements.txt
 cp ../.env.example ../.env   # fill in Razorpay TEST keys, or leave blank for mock mode
 uvicorn app.main:app --port 8123
 ```
-`.env` also carries `AGENT_WARRANT_SECRET` and `RAZORPAY_WEBHOOK_SECRET`,
-which — unlike the Razorpay API keys — are required, not optional:
-they're what an AI-agent session is authorized against, and what a
-payment capture (real or simulated) is verified against, respectively
-(see "Guardrails, explained" below). Working demo defaults ship in
+`.env` also carries `AGENT_WARRANT_SECRET`, `FIT_SUPPLY_WARRANT_SECRET`,
+and `RAZORPAY_WEBHOOK_SECRET`, which — unlike the Razorpay API keys —
+are required, not optional: the first two are what an AI-agent session
+at each of the two demo merchants is authorized against (see
+"Multi-tenancy" below), the third is what a payment capture (real or
+simulated) is verified against. Working demo defaults ship in
 `.env.example`; generate your own with `python -c "import secrets;
 print(secrets.token_hex(24))"` for anything beyond a local demo.
 
@@ -275,6 +276,50 @@ visible, not hidden.
   swapping in Twilio's WhatsApp Sandbox is a drop-in replacement for
   `web_chat/`, not a backend change.
 
+## Multi-tenancy
+
+Two merchants ship out of the box (`backend/app/merchants.py`):
+`demo_merchant` (the original storefront) and `fit_supply_co` (a
+second, unrelated one — gym equipment and supplements) — proving the
+tenant boundary is real, not just a config flag with one merchant
+behind it. Their catalogs deliberately reuse the SAME SKU ids
+(`sku_001` is "Wireless Earbuds Pro" at one and "Adjustable Dumbbell
+Set" at the other) to demonstrate that every lookup is scoped by
+`(merchant_id, product_id)` together — see `catalog.py`.
+
+- `GET /merchants` lists every registered merchant.
+- `GET /merchants/{merchant_id}/catalog`, `POST
+  /merchants/{merchant_id}/session/human`, `POST
+  /merchants/{merchant_id}/session/agent` are the merchant-scoped
+  entry points. The original `/catalog`, `/session/human`,
+  `/session/agent` routes still work, as aliases for
+  `merchant_id=demo_merchant` — the web chat and MCP server need no
+  changes and keep working exactly as before.
+- **Each merchant has its own warrant secret**
+  (`AGENT_WARRANT_SECRET` for `demo_merchant`,
+  `FIT_SUPPLY_WARRANT_SECRET` for `fit_supply_co`, both REQUIRED, same
+  no-blank-fallback rule as before). A warrant genuinely signed for one
+  merchant fails signature verification if presented to a different
+  merchant's session endpoint — an attacker holding one merchant's
+  secret can't mint a session, or spend against a cap, at another.
+- **The daily spending cap is isolated per (agent, merchant)**, not
+  just per agent — `audit.captured_spend_today()` and
+  `orders.pending_spend_today()` both take `merchant_id` and only sum
+  activity at that one merchant. Spend at `fit_supply_co` never
+  depletes a cap at `demo_merchant`, and vice versa
+  (`backend/tests/test_multitenancy.py` proves this both directions).
+- **Stock is isolated too** — decrementing `fit_supply_co`'s `sku_001`
+  at capture time never touches `demo_merchant`'s completely different
+  `sku_001`.
+- A session is bound to exactly one merchant for its entire lifetime;
+  every cart/checkout/pay call resolves `merchant_id` from the session,
+  never from the request body.
+
+Adding a third merchant is just appending an entry to
+`merchants.MERCHANTS` and setting its warrant secret in `.env` —
+nothing else in the codebase hardcodes `demo_merchant` outside the
+backward-compatible aliases above.
+
 ## Persistence
 
 Sessions, carts, and orders are SQLite-backed (`sessions.db`,
@@ -322,13 +367,15 @@ that shouldn't happen without you choosing to do it.
 
 ## Known limitations (honesty over polish)
 
-- Single demo merchant, in-memory catalog — not multi-tenant. This is
-  a deliberate scope boundary, not an oversight: the whole system
-  (one `MERCHANT_ID`, one `AGENT_WARRANT_SECRET`, one catalog) is built
-  and pitched as "agentic commerce for **a** small merchant." Real
-  multi-tenancy (per-merchant catalogs, secrets, isolated audit trails
-  and metrics, tenant routing) is a substantial redesign, not a bug fix
-  — worth doing deliberately, with its own design pass, not bolted on.
+- `GET /metrics` and `GET /audit-trail` are global across every
+  merchant, not filtered per merchant -- the daily spending cap and
+  stock ARE correctly isolated per merchant (see "Multi-tenancy"
+  above), but the growth-metrics dashboard doesn't yet split revenue
+  by merchant the way it already splits it by actor. Would need either
+  a `merchant_id` column on `audit_log` (a real schema migration) or
+  the same per-row session lookup `audit.captured_spend_today` already
+  does for the cap -- deliberately not done here to avoid a slower
+  `/metrics` call for a demo with only two merchants.
 - `POST /webhook/razorpay` has been verified against real Razorpay
   payloads and signature verification logic, but has never actually
   been *called* by a real Razorpay deployment in this environment —
