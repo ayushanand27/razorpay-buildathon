@@ -20,6 +20,7 @@ checkout call returns the original result instead of creating a
 second order.
 """
 
+import datetime
 import time
 import uuid
 
@@ -73,6 +74,26 @@ def find_by_razorpay_order_id(razorpay_order_id: str) -> dict | None:
 
 def get_order(order_id: str) -> dict | None:
     return _ORDERS.get(order_id)
+
+
+def pending_spend_today(actor: str) -> float:
+    """Sum of this actor's orders still sitting in 'created' status
+    (payment initiated but not yet captured OR failed) from today --
+    closes the gap where the daily cap only counted CAPTURED spend
+    (see audit.captured_spend_today). In today's architecture
+    POST /agent/pay always attempts self-capture synchronously in the
+    same request, so an order only lingers in 'created' if the process
+    crashed between creating it and capturing it -- a rare but real
+    case this still needs to count against the cap, not silently drop
+    out of it."""
+    today = datetime.date.today()
+    total = 0.0
+    for order in _ORDERS.values():
+        if order["actor"] != actor or order["status"] != "created":
+            continue
+        if datetime.datetime.fromtimestamp(order["created_at"]).date() == today:
+            total += order["total_inr"]
+    return total
 
 
 def capture_order(order_id: str) -> tuple[bool, str | None]:

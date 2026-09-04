@@ -207,8 +207,14 @@ def test_nlu_strips_think_block_before_parsing_json(monkeypatch):
     """Regression test -- found via live testing against a
     reasoning-variant Groq model that wraps its answer in
     <think>...</think> before the actual JSON, which naive json.loads()
-    can't parse. _call_groq() must strip that block first."""
+    can't parse. _call_groq() must strip that block first.
+
+    Deliberately uses text that does NOT match _try_fast_path's exact
+    phrasings (unlike bare "pay") -- otherwise the fast path would
+    short-circuit before ever reaching _call_groq, and this test would
+    pass without exercising the code it's meant to cover at all."""
     monkeypatch.setattr(nlu, "GROQ_API_KEY", "fake_key_for_test")
+    assert nlu._try_fast_path("I'd like to complete my purchase now") is None
 
     class _FakeResp:
         def raise_for_status(self):
@@ -216,11 +222,11 @@ def test_nlu_strips_think_block_before_parsing_json(monkeypatch):
 
         def json(self):
             return {"choices": [{"message": {
-                "content": '\n<think>\nThe user wants to pay.\n</think>\n\n{"tool":"checkout"}',
+                "content": '\n<think>\nThe user wants to complete their purchase.\n</think>\n\n{"tool":"checkout"}',
             }}]}
 
     monkeypatch.setattr(nlu.requests, "post", lambda *a, **k: _FakeResp())
-    plan = nlu.parse_turn("pay")
+    plan = nlu.parse_turn("I'd like to complete my purchase now")
     assert plan["tool"] == "checkout"
 
 
@@ -296,20 +302,129 @@ def test_nlu_turn_agent_session_cannot_checkout_via_chat(client, monkeypatch):
     assert resp.json()["tool"] == "clarify"
 
 
-def test_nlu_turn_unsupported_remove_intent_falls_back_to_clarify(client, monkeypatch):
-    """Demo phrase: "that's too much, remove the earbuds" -- there is no
-    `remove` tool in the fixed set, so this must land on clarify, not
-    silently do nothing or invent an action."""
+def test_nlu_turn_remove_intent_removes_the_item(client, monkeypatch):
+    """Demo phrase: "that's too much, remove the earbuds" -- `remove` is
+    a real tool now (gap closed), executed through the actual
+    cart.remove_from_cart(), not a hardcoded reply."""
     session_id = make_human_session(client)
+    client.post("/cart/add", json={"session_id": session_id, "product_id": "sku_001", "qty": 1})
     monkeypatch.setattr(nlu, "GROQ_API_KEY", "fake_key_for_test")
     monkeypatch.setattr(nlu, "_call_groq", lambda text: {
-        "tool": "clarify", "message": "I can't remove items yet -- try 'catalog' to start over.",
+        "tool": "remove", "items": [{"product_id": "sku_001"}],
     })
     resp = client.post("/nlu/turn", json={"session_id": session_id, "text": "that's too much, remove the earbuds"})
     assert resp.status_code == 200
-    assert resp.json()["tool"] == "clarify"
+    assert resp.json()["tool"] == "remove"
+
+    cart_resp = client.get(f"/cart/{session_id}")
+    assert cart_resp.json()["cart"] == []
 
 
 def test_nlu_turn_requires_valid_session(client):
     resp = client.post("/nlu/turn", json={"session_id": "not_a_real_session", "text": "pay"})
     assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------
+# Fast-path -- common intents skip Groq entirely (quota mitigation)
+# ---------------------------------------------------------------------
+
+def test_fast_path_matches_never_call_groq(monkeypatch):
+    calls = []
+    monkeypatch.setattr(nlu, "GROQ_API_KEY", "fake_key_for_test")
+    monkeypatch.setattr(nlu, "_call_groq", lambda text: calls.append(text) or {"tool": "clarify"})
+
+    for text in ("pay", "checkout", "cart", "my cart", "catalog", "browse"):
+        plan = nlu.parse_turn(text)
+        assert plan["tool"] in ("checkout", "view_cart", "browse")
+    assert calls == []  # Groq never touched for any of these
+
+
+def test_fast_path_does_not_intercept_ambiguous_text(monkeypatch):
+    monkeypatch.setattr(nlu, "GROQ_API_KEY", "fake_key_for_test")
+    called = []
+    monkeypatch.setattr(nlu, "_call_groq", lambda text: called.append(text) or {"tool": "clarify"})
+    nlu.parse_turn("got anything for gym under 400")
+    assert called == ["got anything for gym under 400"]
+
+
+# ---------------------------------------------------------------------
+# POST /cart/remove
+# ---------------------------------------------------------------------
+
+def test_cart_remove_endpoint(client):
+    session_id = make_human_session(client)
+    client.post("/cart/add", json={"session_id": session_id, "product_id": "sku_001", "qty": 1})
+    client.post("/cart/add", json={"session_id": session_id, "product_id": "sku_003", "qty": 1})
+
+    resp = client.post("/cart/remove", json={"session_id": session_id, "product_id": "sku_001"})
+    assert resp.status_code == 200
+    product_ids = {li["product_id"] for li in resp.json()["cart"]}
+    assert product_ids == {"sku_003"}
+
+
+def test_cart_remove_missing_item_returns_404(client):
+    session_id = make_human_session(client)
+    resp = client.post("/cart/remove", json={"session_id": session_id, "product_id": "sku_001"})
+    assert resp.status_code == 404
+
+
+def test_cart_remove_clears_review_flag(client):
+    """Removing is a mutation too -- a checkout right after a remove
+    (without a fresh review) must still be gated."""
+    session_id = make_human_session(client)
+    client.post("/cart/add", json={"session_id": session_id, "product_id": "sku_001", "qty": 1})
+    client.post("/cart/add", json={"session_id": session_id, "product_id": "sku_003", "qty": 1})
+    client.get(f"/cart/{session_id}")  # reviewed
+
+    client.post("/cart/remove", json={"session_id": session_id, "product_id": "sku_001"})  # mutates again
+
+    resp = client.post("/checkout", json={"session_id": session_id, "idempotency_key": "remove-gate-test"})
+    assert resp.status_code == 403
+    assert "cart_not_reviewed" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------------
+# Daily cap gap -- pending (created but not yet captured/failed)
+# orders count too, not just captured ones
+# ---------------------------------------------------------------------
+
+def test_pending_spend_today_counts_orders_stuck_mid_flight():
+    from app import orders as orders_module
+
+    order_id = orders_module.new_order_id()
+    orders_module.create_order(
+        order_id, "some_session", "ai_agent_mcp",
+        [{"product_id": "sku_001", "qty": 1, "price_inr": 1499}],
+        1499.0, "idem-key-1", {"order_id": order_id}, razorpay_order_id="order_stuck_mid_flight",
+    )
+    # Order is left in "created" status -- simulates a process crash
+    # between order-creation and self-capture.
+    assert orders_module.pending_spend_today("ai_agent_mcp") == 1499.0
+    assert orders_module.pending_spend_today("human_whatsapp") == 0.0
+
+
+def test_stuck_order_counts_toward_daily_cap_at_next_pay_attempt(client):
+    from app import orders as orders_module
+
+    session_id = agent_session_id(client, per_tx_cap_inr=2000, daily_cap_inr=1600)
+
+    # Simulate an order from earlier today that got stuck in "created"
+    # (e.g. a process crash right after order-creation, before
+    # self-capture) -- this must still count against today's cap, even
+    # though it was never captured.
+    stuck_id = orders_module.new_order_id()
+    orders_module.create_order(
+        stuck_id, "some_other_session", "ai_agent_mcp",
+        [{"product_id": "sku_001", "qty": 1, "price_inr": 1499}],
+        1499.0, "stuck-idem-key", {"order_id": stuck_id}, razorpay_order_id="order_stuck",
+    )
+
+    # New attempt: Rs.349, individually well under the Rs.2,000 per-tx
+    # cap -- but 1,499 (stuck) + 349 = 1,848 > 1,600 daily cap.
+    add_and_review(client, session_id, "sku_003", qty=1)
+    resp = client.post("/agent/pay", json={
+        "session_id": session_id, "idempotency_key": "new-attempt", "confirm": True,
+    })
+    assert resp.status_code == 403
+    assert "daily_spending_cap_exceeded" in resp.json()["detail"]

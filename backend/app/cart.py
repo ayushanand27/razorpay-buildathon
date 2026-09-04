@@ -38,6 +38,21 @@ def add_to_cart(session_id: str, product_id: str, qty: int = 1):
     return cart, None
 
 
+def remove_from_cart(session_id: str, product_id: str):
+    """Removes a line item entirely (not a partial-quantity decrement --
+    kept to that one, simple, demoable semantic). Returns (cart, None)
+    on success, (cart, "product_not_in_cart") if there was nothing to
+    remove -- the caller decides whether that's an error worth
+    surfacing."""
+    cart = _CARTS.setdefault(session_id, [])
+    for i, line in enumerate(cart):
+        if line["product_id"] == product_id:
+            cart.pop(i)
+            clear_cart_reviewed(session_id)  # a removal is a mutation too
+            return cart, None
+    return cart, "product_not_in_cart"
+
+
 def cart_total(session_id: str) -> float:
     cart = get_cart(session_id)
     return sum(line["qty"] * line["price_inr"] for line in cart)

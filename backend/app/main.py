@@ -48,6 +48,11 @@ class AddToCartRequest(BaseModel):
     qty: int = 1
 
 
+class RemoveFromCartRequest(BaseModel):
+    session_id: str
+    product_id: str
+
+
 class CheckoutRequest(BaseModel):
     session_id: str
     idempotency_key: str
@@ -73,6 +78,16 @@ def _require_session(session_id: str) -> dict:
     return session
 
 
+def _agent_spend_today() -> float:
+    """CAPTURED spend today PLUS spend still sitting in orders that are
+    'created' but not yet captured or failed today (see
+    orders.pending_spend_today) -- closes the gap where the daily cap
+    only counted captured money and an order stuck mid-flight (e.g. the
+    process crashed between order-creation and self-capture) could
+    silently dodge it."""
+    return audit.captured_spend_today(sessions.AGENT_ACTOR) + orders.pending_spend_today(sessions.AGENT_ACTOR)
+
+
 def _max_cart_total_for_upsell(session: dict) -> float:
     """The ceiling an upsell suggestion must not push the cart total
     past -- an agent's remaining warrant cap (whichever of per-tx or
@@ -82,8 +97,7 @@ def _max_cart_total_for_upsell(session: dict) -> float:
     scratch, at checkout/pay time."""
     if session["actor"] == sessions.AGENT_ACTOR:
         warrant = session["warrant"]
-        spend_today = audit.captured_spend_today(sessions.AGENT_ACTOR)
-        daily_remaining = max(warrant["daily_cap_inr"] - spend_today, 0.0)
+        daily_remaining = max(warrant["daily_cap_inr"] - _agent_spend_today(), 0.0)
         return min(warrant["per_tx_cap_inr"], daily_remaining)
     return guardrails.MAX_ORDER_INR
 
@@ -142,6 +156,22 @@ def add_to_cart(req: AddToCartRequest):
     return {"cart": updated_cart, "total_inr": cart.cart_total(req.session_id), "upsell": upsell}
 
 
+@app.post("/cart/remove")
+def remove_from_cart(req: RemoveFromCartRequest):
+    session = _require_session(req.session_id)
+    actor = session["actor"]
+
+    updated_cart, err = cart.remove_from_cart(req.session_id, req.product_id)
+    if err:
+        audit.log_action(actor, req.session_id, "remove_from_cart", "failed",
+                          details={"reason": err, "product_id": req.product_id})
+        raise HTTPException(404, err)
+
+    audit.log_action(actor, req.session_id, "remove_from_cart", "ok",
+                      details={"product_id": req.product_id})
+    return {"cart": updated_cart, "total_inr": cart.cart_total(req.session_id)}
+
+
 @app.get("/cart/{session_id}")
 def view_cart(session_id: str):
     _require_session(session_id)
@@ -183,18 +213,25 @@ def _format_cart_reply(data: dict) -> str:
     return "\n".join(lines)
 
 
+def _format_remove_results_reply(results: list[dict]) -> str:
+    if not results:
+        return "Couldn't find that in your cart."
+    last = results[-1]
+    return f"Removed. Cart total: Rs.{last['total_inr']}"
+
+
 @app.post("/nlu/turn")
 def nlu_turn(req: NluTurnRequest):
     """
     Free-text fallback for the human web chat, when the message doesn't
     match one of the hardcoded commands. Groq does INTENT CLASSIFICATION
-    ONLY -- it picks a tool name (browse | add | view_cart | checkout |
-    clarify) and, for `add`, which real product_ids are meant; see
-    nlu.py. It never returns a price and never makes an allow/confirm
-    decision. Every tool this endpoint executes is the exact same
-    function the hardcoded chat commands (and /checkout directly) call
-    -- guardrails, idempotency, and the cart-review gate all apply
-    identically; NLU has no way to reach payments.py itself.
+    ONLY -- it picks a tool name (browse | add | remove | view_cart |
+    checkout | clarify) and, for `add`/`remove`, which real product_ids
+    are meant; see nlu.py. It never returns a price and never makes an
+    allow/confirm decision. Every tool this endpoint executes is the
+    exact same function the hardcoded chat commands (and /checkout
+    directly) call -- guardrails, idempotency, and the cart-review gate
+    all apply identically; NLU has no way to reach payments.py itself.
     """
     session = _require_session(req.session_id)
     actor = session["actor"]
@@ -217,6 +254,16 @@ def nlu_turn(req: NluTurnRequest):
                 add_req = AddToCartRequest(session_id=req.session_id, product_id=item["product_id"], qty=item["qty"])
                 results.append(add_to_cart(add_req))
             return {"reply": _format_add_results_reply(results), "tool": "add", "data": results}
+
+        if tool == "remove":
+            results = []
+            for item in plan["items"]:
+                remove_req = RemoveFromCartRequest(session_id=req.session_id, product_id=item["product_id"])
+                try:
+                    results.append(remove_from_cart(remove_req))
+                except HTTPException:
+                    pass  # that item just wasn't in the cart -- skip it, not a hard failure
+            return {"reply": _format_remove_results_reply(results), "tool": "remove", "data": results}
 
         if tool == "view_cart":
             data = view_cart(req.session_id)
@@ -345,7 +392,7 @@ def agent_pay(req: AgentPayRequest):
     try:
         warrant = session["warrant"]
         warrant_signature = session["warrant_signature"]
-        spend_today = audit.captured_spend_today(sessions.AGENT_ACTOR)
+        spend_today = _agent_spend_today()
         cart_reviewed = cart.was_cart_reviewed(req.session_id)
 
         proposal = policy.build_proposal(warrant, warrant_signature, line_items, spend_today, cart_reviewed)
@@ -409,7 +456,7 @@ def agent_remaining_cap(session_id: str):
     if session["actor"] != sessions.AGENT_ACTOR:
         raise HTTPException(400, "remaining-cap only applies to agent sessions")
     warrant = session["warrant"]
-    spend_today = audit.captured_spend_today(sessions.AGENT_ACTOR)
+    spend_today = _agent_spend_today()
     return {
         "per_tx_cap_inr": warrant["per_tx_cap_inr"],
         "daily_remaining_inr": max(warrant["daily_cap_inr"] - spend_today, 0.0),

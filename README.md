@@ -116,6 +116,19 @@ it (same nav strip to jump between all three): `web_chat/catalog.html`
 is a live product grid, and `web_chat/audit-dashboard.html` is a
 readable, auto-refreshing view of the audit trail.
 
+Anything typed that isn't one of those exact commands goes to
+`POST /nlu/turn` (`backend/app/nlu.py`) — Groq-powered intent
+classification restricted to a fixed tool set (`browse`, `add`,
+`remove`, `view_cart`, `checkout`, `clarify`); it is never trusted for
+a price or an allow/block decision, and every tool it picks is
+executed through the exact same cart/checkout functions the hardcoded
+commands call, so every guardrail still applies. Try: *"got anything
+for the gym under 400"*, *"add the bottle and the earbuds"*, *"that's
+too much, remove the earbuds"*, *"pay"*. A handful of unambiguous
+phrasings (`pay`, `cart`, `catalog`, …) are matched locally before ever
+calling Groq, to conserve its free-tier daily quota (also spent by the
+upsell copy, see below) for text that actually needs it.
+
 ### 3. AI buyer demo (MCP)
 ```bash
 cd mcp_server
@@ -167,11 +180,24 @@ Shows every action from both flows, interleaved, in order.
   SKU in the warrant's allowed categories; server price × qty matches
   what the cart's own line items claim (a price-tamper check — the
   actual charge always uses the live server catalog price, never a
-  client-influenced one); per-transaction cap; daily cap (**captured**
-  spend only, not merely orders created); cart reviewed since the last
-  mutation; no line item over stock. It's a pure function of its
-  inputs — same inputs always yield the same decision — and calls no
-  LLM, directly or indirectly.
+  client-influenced one); per-transaction cap; daily cap; cart
+  reviewed since the last mutation; no line item over stock. It's a
+  pure function of its inputs — same inputs always yield the same
+  decision — and calls no LLM, directly or indirectly.
+- **The daily cap counts CAPTURED spend PLUS any order still sitting
+  "created"-but-uncaptured from today** (`orders.pending_spend_today`)
+  — not just what's been captured. In today's architecture
+  `/agent/pay` always self-captures synchronously in the same request,
+  so this second half mainly guards against a rarer case: the process
+  crashing between order-creation and self-capture, which would
+  otherwise leave a "phantom" order that never counts against the cap.
+- **The upsell suggestion is policy-bounded too, not just a slogan**
+  (`catalog.get_upsell`) — it never suggests a SKU that would push the
+  cart total past the buyer's remaining cap (agent: warrant's
+  per-tx/daily remaining; human: `guardrails.MAX_ORDER_INR`), is
+  out of stock, or is already in the cart. Every outcome is logged
+  (`upsell_shown` / `upsell_blocked`, with a reason), and
+  `GET /metrics` reports `upsell_blocked_by_cap_count` separately.
 - **Every policy decision is logged in full**, allow or block, as a
   `policy_decision` audit entry — `POST /agent/pay`'s response and the
   MCP `explain_last_block()` tool both surface this.
@@ -230,3 +256,20 @@ visible, not hidden.
 - The MCP server's per-buyer sessions are process-local, tracked by
   whichever agent conversation calls the tools; there's no persistent
   buyer-identity store across separate MCP server restarts.
+- `POST /webhook/razorpay` has never actually been called by a real
+  Razorpay deployment — there's no public URL for it to reach in this
+  local setup, so it's only ever been exercised by the local
+  `/demo/simulate-capture` stand-in (same verification code, but not
+  proof the integration survives Razorpay's actual delivery behavior).
+- Groq's free tier (1,000 requests/day, shared across upsell-copy
+  generation AND chat NLU) is easy to exhaust during heavy testing or
+  a long demo session with lots of free-text turns — every call
+  degrades gracefully to a static fallback when that happens (never a
+  crash or a stuck request), but a live demo can silently lose the
+  "smart" NLU/upsell-copy behavior mid-recording if the quota runs out
+  first. The chat's fast-path (see above) and the fixed `UPSELL_MAP`
+  reason strings both reduce how often this matters, but don't
+  eliminate it — have a fresh key ready for the actual recording.
+- No concurrency/load testing — idempotency and capture-rollback are
+  proven correct for sequential requests (by the test suite), not for
+  two requests racing the same session/order at once.
