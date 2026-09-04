@@ -195,12 +195,26 @@ def check_and_record_upsell_acceptance(session_id: str, product_id: str) -> bool
         conn.close()
 
 
-def get_upsell_accepted_count() -> int:
+def get_upsell_accepted_count(merchant_id: str | None = None) -> int:
+    """carts.db has no merchant_id column of its own -- when scoping to
+    one merchant, each acceptance's session_id is resolved back to its
+    merchant via sessions.get_session() and filtered, the same
+    cross-store approach audit.captured_spend_today() and metrics.py
+    already use."""
     conn = _get_conn()
     try:
-        return conn.execute("SELECT COUNT(*) FROM upsell_acceptances").fetchone()[0]
+        if merchant_id is None:
+            return conn.execute("SELECT COUNT(*) FROM upsell_acceptances").fetchone()[0]
+        session_ids = [r[0] for r in conn.execute("SELECT session_id FROM upsell_acceptances").fetchall()]
     finally:
         conn.close()
+
+    from . import sessions  # local import -- avoids a circular import at module load time
+
+    return sum(
+        1 for session_id in session_ids
+        if (session := sessions.get_session(session_id)) and session.get("merchant_id") == merchant_id
+    )
 
 
 def mark_cart_reviewed(session_id: str):

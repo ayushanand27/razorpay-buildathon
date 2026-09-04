@@ -9,8 +9,17 @@ conflating them.
 
 Every number here is a read over data the rest of the system was
 already writing for the "explainable" requirement (audit.py's SQLite
-trail), plus one small in-memory counter in cart.py for upsell
+trail), plus one small counter in cart.py's SQLite store for upsell
 acceptance. No new tables, no schema migration.
+
+Merchant-scoped: pass merchant_id to get_metrics() to see just ONE
+merchant's numbers (GET /merchants/{merchant_id}/metrics), or omit it
+for the global, all-merchants total (GET /metrics, unchanged default
+behavior). audit_log has no merchant_id column of its own -- rather
+than a schema migration, each row's actor_id (always a session_id,
+see audit.log_action()'s call sites) is resolved back to its merchant
+via sessions.get_session() and filtered in Python, the same approach
+audit.captured_spend_today() already uses for the daily cap.
 """
 
 import json
@@ -21,7 +30,10 @@ from . import audit, cart
 ACTORS = ("human_whatsapp", "ai_agent_mcp")
 
 
-def _query_scalar(sql: str, params: tuple = ()):
+def _rows(action: str, statuses: tuple[str, ...], actor: str | None = None) -> list[tuple]:
+    """Returns (actor_id, amount_inr, details) rows matching action/statuses
+    (and actor, if given) -- the raw material every aggregate below is
+    computed from, so merchant filtering only has to happen in one place."""
     conn = sqlite3.connect(audit.DB_PATH)
     try:
         # Same schema as audit.py's _get_conn() -- /metrics can be the
@@ -41,91 +53,73 @@ def _query_scalar(sql: str, params: tuple = ()):
             )
             """
         )
-        return conn.execute(sql, params).fetchone()[0]
+        placeholders = ",".join("?" * len(statuses))
+        sql = f"SELECT actor_id, amount_inr, details FROM audit_log WHERE action = ? AND status IN ({placeholders})"
+        params = [action, *statuses]
+        if actor:
+            sql += " AND actor = ?"
+            params.append(actor)
+        return conn.execute(sql, tuple(params)).fetchall()
     finally:
         conn.close()
 
 
-def _captured_inr(actor: str | None = None) -> float:
+def _filter_by_merchant(rows: list[tuple], merchant_id: str | None) -> list[tuple]:
+    if merchant_id is None:
+        return rows
+    from . import sessions  # local import -- avoids a circular import at module load time
+
+    filtered = []
+    for row in rows:
+        session_id = row[0]
+        session = sessions.get_session(session_id)
+        if session and session.get("merchant_id") == merchant_id:
+            filtered.append(row)
+    return filtered
+
+
+def _sum_amount(action: str, statuses: tuple[str, ...], actor: str | None = None,
+                 merchant_id: str | None = None) -> float:
+    rows = _filter_by_merchant(_rows(action, statuses, actor), merchant_id)
+    return sum(r[1] or 0.0 for r in rows)
+
+
+def _count(action: str, statuses: tuple[str, ...], actor: str | None = None,
+           merchant_id: str | None = None) -> int:
+    return len(_filter_by_merchant(_rows(action, statuses, actor), merchant_id))
+
+
+def _captured_inr(actor: str | None = None, merchant_id: str | None = None) -> float:
     """CAPTURED revenue only -- payment_confirmed, status=paid. This is
     the number that actually moved money; a checkout_payment row alone
     (a payment link being created) is not proof of that."""
-    sql = "SELECT COALESCE(SUM(amount_inr), 0.0) FROM audit_log WHERE action = 'payment_confirmed' AND status = 'paid'"
-    params: tuple = ()
-    if actor:
-        sql += " AND actor = ?"
-        params = (actor,)
-    return _query_scalar(sql, params)
+    return _sum_amount("payment_confirmed", ("paid",), actor, merchant_id)
 
 
-def _orders_created_inr(actor: str | None = None) -> float:
-    """Payment LINKS created (ok + retried) -- may include links never
-    actually paid. Compared against _captured_inr(), this is the
+def _orders_created_inr(actor: str | None = None, merchant_id: str | None = None) -> float:
+    """Payment LINKS/orders created (ok + retried) -- may include ones
+    never actually paid. Compared against _captured_inr(), this is the
     "created but not yet captured" gap the dashboard shows."""
-    sql = "SELECT COALESCE(SUM(amount_inr), 0.0) FROM audit_log WHERE action = 'checkout_payment' AND status IN ('ok', 'retried')"
-    params: tuple = ()
-    if actor:
-        sql += " AND actor = ?"
-        params = (actor,)
-    return _query_scalar(sql, params)
+    return _sum_amount("checkout_payment", ("ok", "retried"), actor, merchant_id)
 
 
-def _refunded_inr(actor: str | None = None) -> float:
+def _refunded_inr(actor: str | None = None, merchant_id: str | None = None) -> float:
     """Sum of successfully refunded orders (action='refund', status='ok')
     -- captured_inr/total_revenue_inr are left as the GROSS captured
     figure (unchanged meaning, for backward compatibility); this is a
     separate figure so a refund shows up honestly rather than silently
     vanishing from either number."""
-    sql = "SELECT COALESCE(SUM(amount_inr), 0.0) FROM audit_log WHERE action = 'refund' AND status = 'ok'"
-    params: tuple = ()
-    if actor:
-        sql += " AND actor = ?"
-        params = (actor,)
-    return _query_scalar(sql, params)
+    return _sum_amount("refund", ("ok",), actor, merchant_id)
 
 
-def _count(action: str, statuses: tuple[str, ...], actor: str | None = None) -> int:
-    placeholders = ",".join("?" * len(statuses))
-    sql = f"SELECT COUNT(*) FROM audit_log WHERE action = ? AND status IN ({placeholders})"
-    params = [action, *statuses]
-    if actor:
-        sql += " AND actor = ?"
-        params.append(actor)
-    return _query_scalar(sql, tuple(params))
-
-
-def _upsell_blocked_by_cap_count() -> int:
+def _upsell_blocked_by_cap_count(merchant_id: str | None = None) -> int:
     """Counts upsell_blocked entries specifically for reason ==
     would_exceed_cap -- the other two blocked reasons (oos,
     already_in_cart) aren't spending-cap events, so they're excluded
-    from this specific counter. Filters in Python rather than via
-    SQLite's json_extract() to stay portable across sqlite3 builds
-    without a JSON1 dependency; the audit trail is small enough that
-    this costs nothing in practice."""
-    conn = sqlite3.connect(audit.DB_PATH)
-    try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp REAL NOT NULL,
-                actor TEXT NOT NULL,
-                actor_id TEXT,
-                action TEXT NOT NULL,
-                amount_inr REAL,
-                status TEXT NOT NULL,
-                details TEXT
-            )
-            """
-        )
-        rows = conn.execute(
-            "SELECT details FROM audit_log WHERE action = 'upsell_blocked' AND status = 'blocked'"
-        ).fetchall()
-    finally:
-        conn.close()
-
+    from this specific counter."""
+    rows = _filter_by_merchant(_rows("upsell_blocked", ("blocked",)), merchant_id)
     count = 0
-    for (details_json,) in rows:
+    for (_actor_id, _amount, details_json) in rows:
         try:
             if json.loads(details_json or "{}").get("reason") == "would_exceed_cap":
                 count += 1
@@ -134,40 +128,41 @@ def _upsell_blocked_by_cap_count() -> int:
     return count
 
 
-def _conversion_rate(actor: str | None = None) -> float:
-    attempts = _count("checkout_attempt", ("ok",), actor)
-    payments = _count("checkout_payment", ("ok", "retried"), actor)
+def _conversion_rate(actor: str | None = None, merchant_id: str | None = None) -> float:
+    attempts = _count("checkout_attempt", ("ok",), actor, merchant_id)
+    payments = _count("checkout_payment", ("ok", "retried"), actor, merchant_id)
     if attempts == 0:
         return 0.0
     return round(payments / attempts * 100, 1)
 
 
-def get_metrics():
-    upsell_shown_count = _count("upsell_shown", ("ok",))
-    upsell_accepted_count = cart.get_upsell_accepted_count()
+def get_metrics(merchant_id: str | None = None):
+    upsell_shown_count = _count("upsell_shown", ("ok",), merchant_id=merchant_id)
+    upsell_accepted_count = cart.get_upsell_accepted_count(merchant_id)
     upsell_acceptance_rate = (
         round(upsell_accepted_count / upsell_shown_count * 100, 1) if upsell_shown_count else 0.0
     )
 
-    captured = _captured_inr()
-    orders_created = _orders_created_inr()
-    refunded = _refunded_inr()
+    captured = _captured_inr(merchant_id=merchant_id)
+    orders_created = _orders_created_inr(merchant_id=merchant_id)
+    refunded = _refunded_inr(merchant_id=merchant_id)
 
     return {
+        "merchant_id": merchant_id,  # None means "global, across every merchant"
         "total_revenue_inr": captured,
         "captured_inr": captured,
         "orders_created_inr": orders_created,
         "refunded_inr": refunded,
         "net_revenue_inr": captured - refunded,
-        "revenue_by_actor": {a: _captured_inr(a) for a in ACTORS},
-        "orders_created_by_actor": {a: _orders_created_inr(a) for a in ACTORS},
-        "refunded_by_actor": {a: _refunded_inr(a) for a in ACTORS},
+        "revenue_by_actor": {a: _captured_inr(a, merchant_id) for a in ACTORS},
+        "orders_created_by_actor": {a: _orders_created_inr(a, merchant_id) for a in ACTORS},
+        "refunded_by_actor": {a: _refunded_inr(a, merchant_id) for a in ACTORS},
         "checkout_conversion_rate": {
-            "overall": _conversion_rate(),
-            "by_actor": {a: _conversion_rate(a) for a in ACTORS},
+            "overall": _conversion_rate(merchant_id=merchant_id),
+            "by_actor": {a: _conversion_rate(a, merchant_id) for a in ACTORS},
         },
         "upsell_shown_count": upsell_shown_count,
         "upsell_accepted_count": upsell_accepted_count,
         "upsell_acceptance_rate": upsell_acceptance_rate,
-        "upsell_blocked_by_cap_count": _upsell_blocked_by_cap_count(),
+        "upsell_blocked_by_cap_count": _upsell_blocked_by_cap_count(merchant_id),
     }

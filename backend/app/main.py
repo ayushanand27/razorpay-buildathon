@@ -658,8 +658,17 @@ def audit_trail(limit: int = 50):
 
 
 @app.get("/metrics")
-def get_metrics():
-    return metrics.get_metrics()
+def get_metrics(merchant_id: str | None = None):
+    """Global (every merchant combined) by default, matching the
+    original behavior; pass ?merchant_id=... for one merchant's own
+    numbers, or use GET /merchants/{merchant_id}/metrics below."""
+    return metrics.get_metrics(merchant_id)
+
+
+@app.get("/merchants/{merchant_id}/metrics")
+def get_merchant_metrics(merchant_id: str):
+    _require_merchant(merchant_id)
+    return metrics.get_metrics(merchant_id)
 
 
 @app.get("/health")

@@ -320,6 +320,19 @@ Adding a third merchant is just appending an entry to
 nothing else in the codebase hardcodes `demo_merchant` outside the
 backward-compatible aliases above.
 
+**Metrics are merchant-scoped too**: `GET
+/merchants/{merchant_id}/metrics` (or `GET /metrics?merchant_id=...`)
+returns just that merchant's own revenue, conversion rate, and upsell
+numbers; the plain `GET /metrics` (no param) still returns the global
+total across every merchant combined, unchanged default behavior.
+`audit_log` has no `merchant_id` column of its own — rather than a
+schema migration, each row's `actor_id` (always a `session_id`) is
+resolved back to its merchant via `sessions.get_session()` and
+filtered, the same approach `audit.captured_spend_today()` already
+uses for the daily cap. `web_chat/metrics.html` requests
+`merchant_id=demo_merchant` explicitly, so that dashboard shows just
+that storefront's numbers, not `fit_supply_co`'s activity mixed in.
+
 ## Persistence
 
 Sessions, carts, and orders are SQLite-backed (`sessions.db`,
@@ -367,15 +380,13 @@ that shouldn't happen without you choosing to do it.
 
 ## Known limitations (honesty over polish)
 
-- `GET /metrics` and `GET /audit-trail` are global across every
-  merchant, not filtered per merchant -- the daily spending cap and
-  stock ARE correctly isolated per merchant (see "Multi-tenancy"
-  above), but the growth-metrics dashboard doesn't yet split revenue
-  by merchant the way it already splits it by actor. Would need either
-  a `merchant_id` column on `audit_log` (a real schema migration) or
-  the same per-row session lookup `audit.captured_spend_today` already
-  does for the cap -- deliberately not done here to avoid a slower
-  `/metrics` call for a demo with only two merchants.
+- `GET /audit-trail` is still global across every merchant (unfiltered
+  by `merchant_id`) — `GET /metrics` is NOT (see "Multi-tenancy"
+  above, `?merchant_id=...` or `/merchants/{id}/metrics`). Filtering
+  the raw audit trail itself the same way is the same technique, just
+  not done yet — lower priority since the trail is mainly read
+  narratively (`GET /audit-trail`, `web_chat/audit-dashboard.html`),
+  not aggregated, so a demo with two merchants reads fine unfiltered.
 - `POST /webhook/razorpay` has been verified against real Razorpay
   payloads and signature verification logic, but has never actually
   been *called* by a real Razorpay deployment in this environment —

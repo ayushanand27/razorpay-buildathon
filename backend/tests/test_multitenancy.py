@@ -267,3 +267,73 @@ def test_stock_decrement_at_one_merchant_does_not_touch_the_others_sku(client):
 
     assert catalog.get_product(FIT_SUPPLY, "sku_001")["stock"] == fit_stock_before - 1
     assert catalog.get_product(DEMO, "sku_001")["stock"] == demo_stock_before  # untouched
+
+
+# ---------------------------------------------------------------------
+# Per-merchant metrics
+# ---------------------------------------------------------------------
+
+def test_merchant_metrics_endpoint_isolated_from_global(client):
+    """A captured purchase at fit_supply_co must show up in
+    fit_supply_co's own GET /merchants/{id}/metrics, but not in
+    demo_merchant's."""
+    session_id = sign_and_mint_agent_session(client, FIT_SUPPLY, per_tx_cap_inr=5000, daily_cap_inr=5000).json()["session_id"]
+    add_and_review(client, session_id, "sku_006")  # Yoga Mat, Rs.899
+    resp = client.post("/agent/pay", json={"session_id": session_id, "idempotency_key": uuid.uuid4().hex, "confirm": True})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "captured"
+
+    fit_metrics = client.get(f"/merchants/{FIT_SUPPLY}/metrics").json()
+    assert fit_metrics["merchant_id"] == FIT_SUPPLY
+    assert fit_metrics["captured_inr"] == 899.0
+
+    demo_metrics = client.get(f"/merchants/{DEMO}/metrics").json()
+    assert demo_metrics["captured_inr"] == 0.0
+
+
+def test_global_metrics_include_both_merchants_combined(client):
+    """GET /metrics (no merchant_id) must still show the SUM across
+    every merchant -- unchanged default behavior."""
+    demo_session = sign_and_mint_agent_session(client, DEMO, per_tx_cap_inr=2000, daily_cap_inr=2000).json()["session_id"]
+    add_and_review(client, demo_session, "sku_001")  # Rs.1499
+    r1 = client.post("/agent/pay", json={"session_id": demo_session, "idempotency_key": uuid.uuid4().hex, "confirm": True})
+    assert r1.status_code == 200
+
+    fit_session = sign_and_mint_agent_session(client, FIT_SUPPLY, per_tx_cap_inr=5000, daily_cap_inr=5000).json()["session_id"]
+    add_and_review(client, fit_session, "sku_006")  # Rs.899
+    r2 = client.post("/agent/pay", json={"session_id": fit_session, "idempotency_key": uuid.uuid4().hex, "confirm": True})
+    assert r2.status_code == 200
+
+    global_metrics = client.get("/metrics").json()
+    assert global_metrics["merchant_id"] is None
+    assert global_metrics["captured_inr"] == 1499.0 + 899.0
+
+    # ?merchant_id= query param form works identically to the
+    # /merchants/{id}/metrics route.
+    scoped_via_query = client.get("/metrics", params={"merchant_id": DEMO}).json()
+    scoped_via_route = client.get(f"/merchants/{DEMO}/metrics").json()
+    assert scoped_via_query == scoped_via_route
+    assert scoped_via_query["captured_inr"] == 1499.0
+
+
+def test_merchant_metrics_upsell_counts_isolated(client):
+    """upsell_shown_count / upsell_accepted_count must also be scoped
+    per merchant, not global, when a merchant_id is given."""
+    session_id = sign_and_mint_agent_session(client, FIT_SUPPLY, per_tx_cap_inr=8000, daily_cap_inr=8000).json()["session_id"]
+    add_resp = add_and_review(client, session_id, "sku_001")  # dumbbells -- upsell -> sku_006 (yoga mat)
+    assert add_resp["upsell"]["product_id"] == "sku_006"
+
+    add_and_review(client, session_id, "sku_006")  # accept the upsell
+
+    fit_metrics = client.get(f"/merchants/{FIT_SUPPLY}/metrics").json()
+    assert fit_metrics["upsell_shown_count"] >= 1
+    assert fit_metrics["upsell_accepted_count"] >= 1
+
+    demo_metrics = client.get(f"/merchants/{DEMO}/metrics").json()
+    assert demo_metrics["upsell_shown_count"] == 0
+    assert demo_metrics["upsell_accepted_count"] == 0
+
+
+def test_unknown_merchant_metrics_404s(client):
+    resp = client.get("/merchants/not_a_real_merchant/metrics")
+    assert resp.status_code == 404

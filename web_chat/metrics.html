@@ -159,7 +159,10 @@ function render(data) {
 async function loadMetrics() {
   const content = document.getElementById('content');
   try {
-    const res = await fetch(BACKEND + '/metrics');
+    // Scoped to demo_merchant -- this dashboard is that storefront's
+    // own numbers, not a global total across every registered merchant
+    // (see backend/app/merchants.py).
+    const res = await fetch(BACKEND + '/metrics?merchant_id=demo_merchant');
     const data = await res.json();
     render(data);
   } catch (err) {
