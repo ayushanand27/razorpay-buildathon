@@ -70,6 +70,20 @@ def _orders_created_inr(actor: str | None = None) -> float:
     return _query_scalar(sql, params)
 
 
+def _refunded_inr(actor: str | None = None) -> float:
+    """Sum of successfully refunded orders (action='refund', status='ok')
+    -- captured_inr/total_revenue_inr are left as the GROSS captured
+    figure (unchanged meaning, for backward compatibility); this is a
+    separate figure so a refund shows up honestly rather than silently
+    vanishing from either number."""
+    sql = "SELECT COALESCE(SUM(amount_inr), 0.0) FROM audit_log WHERE action = 'refund' AND status = 'ok'"
+    params: tuple = ()
+    if actor:
+        sql += " AND actor = ?"
+        params = (actor,)
+    return _query_scalar(sql, params)
+
+
 def _count(action: str, statuses: tuple[str, ...], actor: str | None = None) -> int:
     placeholders = ",".join("?" * len(statuses))
     sql = f"SELECT COUNT(*) FROM audit_log WHERE action = ? AND status IN ({placeholders})"
@@ -137,13 +151,17 @@ def get_metrics():
 
     captured = _captured_inr()
     orders_created = _orders_created_inr()
+    refunded = _refunded_inr()
 
     return {
         "total_revenue_inr": captured,
         "captured_inr": captured,
         "orders_created_inr": orders_created,
+        "refunded_inr": refunded,
+        "net_revenue_inr": captured - refunded,
         "revenue_by_actor": {a: _captured_inr(a) for a in ACTORS},
         "orders_created_by_actor": {a: _orders_created_inr(a) for a in ACTORS},
+        "refunded_by_actor": {a: _refunded_inr(a) for a in ACTORS},
         "checkout_conversion_rate": {
             "overall": _conversion_rate(),
             "by_actor": {a: _conversion_rate(a) for a in ACTORS},

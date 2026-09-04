@@ -217,6 +217,8 @@ def test_nlu_strips_think_block_before_parsing_json(monkeypatch):
     assert nlu._try_fast_path("I'd like to complete my purchase now") is None
 
     class _FakeResp:
+        status_code = 200
+
         def raise_for_status(self):
             pass
 

@@ -9,6 +9,8 @@ Razorpay test-mode integration -- two separate rails:
     Razorpay Order object instead, which this demo then confirms via a
     signed simulate-capture call (see webhooks.py) rather than a real
     card payment.
+  - create_refund(): Refunds API (POST /refund), either rail -- reverses
+    a captured payment and restores stock (see orders.refund_order()).
 
 Uses TEST mode keys only (rzp_test_...) -- get these free from the
 Razorpay Dashboard -> Settings -> API Keys (test mode toggle on). No
@@ -165,6 +167,39 @@ def create_agent_order(amount_inr: float, receipt: str, notes: dict | None = Non
     resp = requests.post(
         f"{RAZORPAY_BASE}/orders",
         json=payload,
+        auth=HTTPBasicAuth(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
+        timeout=10,
+    )
+    if resp.status_code >= 400:
+        try:
+            body = resp.json()
+        except ValueError:
+            body = {"raw": resp.text}
+        raise PaymentFailure(f"razorpay_api_error_{resp.status_code}", retryable=False, response_body=body)
+    return resp.json()
+
+
+def create_refund(payment_id: str, amount_inr: float) -> dict:
+    """
+    Issues a Razorpay test-mode refund against a captured payment (real
+    Razorpay Refunds API -- POST /v1/payments/{id}/refund -- or a mock
+    response if no keys are configured). Raises PaymentFailure (not
+    retryable) on a real API error. Full refunds only -- no partial-
+    amount support, matching orders.refund_order()'s all-or-nothing
+    stock restoration.
+    """
+    if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
+        return {
+            "id": f"rfnd_MOCK{uuid.uuid4().hex[:10]}",
+            "payment_id": payment_id,
+            "amount": int(amount_inr * 100),
+            "status": "processed",
+            "mock": True,
+        }
+
+    resp = requests.post(
+        f"{RAZORPAY_BASE}/payments/{payment_id}/refund",
+        json={"amount": int(amount_inr * 100)},
         auth=HTTPBasicAuth(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
         timeout=10,
     )

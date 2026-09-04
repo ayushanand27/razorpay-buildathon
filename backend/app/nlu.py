@@ -36,7 +36,7 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
-from . import catalog
+from . import catalog, groq_keys
 
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
@@ -144,19 +144,25 @@ def _build_prompt(text: str) -> str:
     )
 
 
+def _post_groq(key: str, text: str):
+    return requests.post(
+        GROQ_API_URL,
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        json={
+            "model": GROQ_MODEL,
+            "max_tokens": MAX_TOKENS,
+            "temperature": 0,
+            "messages": [{"role": "user", "content": _build_prompt(text)}],
+        },
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
+
+
 def _call_groq(text: str) -> dict | None:
     try:
-        resp = requests.post(
-            GROQ_API_URL,
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": GROQ_MODEL,
-                "max_tokens": MAX_TOKENS,
-                "temperature": 0,
-                "messages": [{"role": "user", "content": _build_prompt(text)}],
-            },
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
+        resp = groq_keys.post_with_rotation(_post_groq, GROQ_API_KEY, text)
+        if resp is None:
+            return None
         resp.raise_for_status()
         content = resp.json()["choices"][0]["message"]["content"].strip()
         # Some models (reasoning variants) prepend a <think>...</think>

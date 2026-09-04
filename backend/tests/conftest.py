@@ -6,12 +6,11 @@ ever imported (each app module's load_dotenv() call does not override
 an already-set os.environ value, so setting these first pins them for
 the whole test session regardless of what the real .env contains).
 
-Every test gets a fresh audit DB (a temp file, not the real
-audit_trail.db) and fresh in-memory state (carts, sessions, orders,
-catalog stock) via the autouse `_isolated_state` fixture -- tests never
-leak state into each other or into the real demo process (which is a
-separate Python process anyway, but within a single `pytest` run the
-same imported modules are shared across all test functions).
+Every test gets a fresh, empty SQLite file for each persisted store
+(audit trail, sessions, carts, orders -- see each module's own
+DB_PATH) plus fresh catalog stock, via the autouse `_isolated_state`
+fixture -- tests never leak state into each other or into the real
+demo process's own database files.
 """
 
 import os
@@ -38,17 +37,9 @@ def client():
 @pytest.fixture(autouse=True)
 def _isolated_state(tmp_path, monkeypatch):
     monkeypatch.setattr(audit, "DB_PATH", str(tmp_path / "audit_trail_test.db"))
-
-    cart._CARTS.clear()
-    cart._CART_REVIEWED.clear()
-    cart._SUGGESTED_UPSELLS.clear()
-    cart._upsell_accepted_count = 0
-
-    sessions._SESSIONS.clear()
-    sessions._USED_NONCES.clear()
-
-    orders._ORDERS.clear()
-    orders._IDEMPOTENCY.clear()
+    monkeypatch.setattr(sessions, "DB_PATH", str(tmp_path / "sessions_test.db"))
+    monkeypatch.setattr(cart, "DB_PATH", str(tmp_path / "carts_test.db"))
+    monkeypatch.setattr(orders, "DB_PATH", str(tmp_path / "orders_test.db"))
 
     catalog.reset_stock_for_tests()
 

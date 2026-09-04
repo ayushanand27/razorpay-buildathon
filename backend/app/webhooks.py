@@ -69,8 +69,8 @@ def _verify_signature(body: bytes, signature: str, secret: str) -> bool:
         return False
 
 
-def _capture_and_log(order: dict, source: str) -> tuple[bool, str | None]:
-    ok, reason = orders_mod.capture_order(order["order_id"])
+def _capture_and_log(order: dict, source: str, payment_id: str | None = None) -> tuple[bool, str | None]:
+    ok, reason = orders_mod.capture_order(order["order_id"], payment_id=payment_id)
     if ok:
         audit.log_action(order["actor"], order["session_id"], "payment_confirmed", "paid",
                           amount_inr=order["total_inr"],
@@ -124,7 +124,7 @@ def handle_webhook(body: bytes, signature: str, source: str = "webhook") -> dict
             order = orders_mod.find_by_razorpay_order_id(razorpay_order_id)
 
         if order:
-            _capture_and_log(order, source)
+            _capture_and_log(order, source, payment_id=payment_entity.get("id"))
         else:
             audit.log_action("razorpay_webhook", payment_link_id or razorpay_order_id or "unknown",
                               "payment_confirmed", "unmatched",

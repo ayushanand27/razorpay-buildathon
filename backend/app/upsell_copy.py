@@ -9,7 +9,9 @@ string, when an API key is configured.
 
 Uses Groq's free-tier API (OpenAI-compatible chat completions,
 Llama-hosted) -- no paid account needed, matching the rest of this
-project's "100% free" stack.
+project's "100% free" stack. If a backup key is configured
+(GROQ_API_KEY_2, ...), a 429 (rate limit exhausted) on one key is
+retried against the next automatically -- see groq_keys.py.
 
 Deliberately isolated from guardrail/payment/audit logic: this is
 called from catalog.get_upsell() only, never touches checkout,
@@ -23,6 +25,8 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
+
+from . import groq_keys
 
 # .env lives at the project root, one level above backend/ -- same
 # loading pattern as payments.py / webhooks.py. Needed here because
@@ -57,19 +61,21 @@ def generate_reason(cart_items: list[dict], suggested_product_name: str, static_
             f'they also add "{suggested_product_name}" -- tailored to what\'s '
             f"actually in their cart."
         )
-        resp = requests.post(
-            GROQ_API_URL,
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": GROQ_MODEL,
-                "max_tokens": 60,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
+        def _post(key: str):
+            return requests.post(
+                GROQ_API_URL,
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json={
+                    "model": GROQ_MODEL,
+                    "max_tokens": 60,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
+
+        resp = groq_keys.post_with_rotation(_post, GROQ_API_KEY)
+        if resp is None:
+            return static_fallback
         resp.raise_for_status()
         text = resp.json()["choices"][0]["message"]["content"].strip()
         return text or static_fallback

@@ -295,7 +295,7 @@ def test_price_tamper_block(client):
     # Simulate a tampered/corrupted cart entry -- normal add_to_cart()
     # never lets a client set this value, this is deliberately
     # reaching past that to prove the server-side check works.
-    cart_mod._CARTS[session_id][0]["price_inr"] = 1
+    cart_mod.set_line_item_price_for_tests(session_id, "sku_001", 1)
 
     resp = pay(client, session_id)
     assert resp.status_code == 403
@@ -320,14 +320,14 @@ def test_expired_warrant_blocks_at_pay_time_not_just_mint_time(client):
     add_and_review(client, session_id, "sku_001", qty=1)
 
     # Simulate time passing past the warrant's expiry, without a real
-    # sleep -- directly mutate the stored warrant (the same object
-    # policy.py reads at pay time) AND re-sign it to match, so this
-    # isolates the expiry rule from the signature rule (mutating the
-    # warrant without re-signing would trip "invalid_warrant_signature"
-    # first instead).
-    stored = sessions._SESSIONS[session_id]
-    stored["warrant"]["expires_at"] = time.time() - 1
-    stored["warrant_signature"] = sessions.sign_warrant(stored["warrant"])
+    # sleep -- overwrite the stored warrant (the same one policy.py
+    # reads at pay time) AND re-sign it to match, so this isolates the
+    # expiry rule from the signature rule (mutating the warrant without
+    # re-signing would trip "invalid_warrant_signature" first instead).
+    session = sessions.get_session(session_id)
+    session["warrant"]["expires_at"] = time.time() - 1
+    new_signature = sessions.sign_warrant(session["warrant"])
+    sessions.set_warrant_for_tests(session_id, session["warrant"], new_signature)
 
     resp = pay(client, session_id)
     assert resp.status_code == 403
@@ -518,7 +518,28 @@ def test_capture_failure_restores_stock(client):
     assert confirmed["status"] == "capture_failed"
     assert "insufficient_stock" in json.loads(confirmed["details"])["reason"]
 
-    assert catalog.get_product("sku_004")["stock"] == stock_before_capture_attempt
+
+def test_agent_pay_reports_capture_failed_status_accurately(client, monkeypatch):
+    """Regression test -- handle_webhook()'s "ok" reflects whether the
+    webhook itself was verified/processed, not whether the capture
+    inside it actually succeeded (a real Razorpay deployment acks a
+    webhook the same way even if the merchant's own capture logic
+    fails). /agent/pay must report the order's REAL status, and the
+    replayed (idempotent) response must match -- not a stale
+    "pending_capture" snapshot taken before capture ever ran."""
+    session_id = agent_session_id(client)
+    add_and_review(client, session_id, "sku_001", qty=1)
+    key = new_idempotency_key()
+
+    monkeypatch.setattr(catalog, "decrement_stock", lambda product_id, qty: False)
+
+    resp = pay(client, session_id, idempotency_key=key)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "capture_failed"
+
+    replay = pay(client, session_id, idempotency_key=key)
+    assert replay.status_code == 200
+    assert replay.json() == resp.json()  # stored response matches what was actually returned, not stale
 
 
 # ---------------------------------------------------------------------

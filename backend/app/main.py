@@ -18,7 +18,9 @@ into first (see sessions.py: POST /session/human, POST /session/agent).
 """
 
 import json
+import threading
 import uuid
+from collections import defaultdict
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -35,6 +37,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Idempotency (both rails) is a check-then-act sequence spanning
+# several steps (guardrail checks, a payment API call, order creation)
+# -- two concurrent requests carrying the SAME (session_id,
+# idempotency_key), e.g. a genuine network retry racing the original,
+# could otherwise both pass the "does this order already exist?" check
+# before either has created it, producing two orders instead of one.
+# A per-session lock serializes only that one buyer's own concurrent
+# attempts; different sessions still process fully in parallel.
+_session_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
+_session_locks_guard = threading.Lock()
+
+
+def _get_session_lock(session_id: str) -> threading.Lock:
+    with _session_locks_guard:
+        return _session_locks[session_id]
 
 
 class AgentWarrantRequest(BaseModel):
@@ -69,6 +87,11 @@ class AgentPayRequest(BaseModel):
 class NluTurnRequest(BaseModel):
     session_id: str
     text: str
+
+
+class RefundRequest(BaseModel):
+    session_id: str
+    order_id: str
 
 
 def _require_session(session_id: str) -> dict:
@@ -296,68 +319,74 @@ def checkout(req: CheckoutRequest):
     if actor != sessions.HUMAN_ACTOR:
         raise HTTPException(400, "agents must use /agent/pay -- /checkout is the human (Payment Links) rail")
 
-    existing = orders.find_existing_order(req.session_id, req.idempotency_key)
-    if existing:
-        audit.log_action(actor, req.session_id, "checkout_replayed", "ok",
-                          amount_inr=existing["total_inr"],
-                          details={"idempotency_key": req.idempotency_key, "order_id": existing["order_id"]})
-        return existing["response"]
+    # Serializes this SESSION's own concurrent checkout attempts (e.g. a
+    # genuine network retry racing the original request) so the
+    # idempotency check-then-create sequence below can't have two
+    # callers both pass the "does this order exist yet?" check before
+    # either creates it. Different sessions are unaffected.
+    with _get_session_lock(req.session_id):
+        existing = orders.find_existing_order(req.session_id, req.idempotency_key)
+        if existing:
+            audit.log_action(actor, req.session_id, "checkout_replayed", "ok",
+                              amount_inr=existing["total_inr"],
+                              details={"idempotency_key": req.idempotency_key, "order_id": existing["order_id"]})
+            return existing["response"]
 
-    line_items = cart.get_cart(req.session_id)
-    if not line_items:
-        raise HTTPException(400, "cart_empty")
+        line_items = cart.get_cart(req.session_id)
+        if not line_items:
+            raise HTTPException(400, "cart_empty")
 
-    total = cart.cart_total(req.session_id)
+        total = cart.cart_total(req.session_id)
 
-    try:
-        # ---- Guardrail check (bounded + gated) ----
         try:
-            # cart_not_reviewed checked first -- a workflow precondition,
-            # ahead of the stock check below.
-            check_cart_reviewed(cart.was_cart_reviewed(req.session_id))
-            check_checkout_allowed(line_items)
-        except GuardrailBlocked as e:
-            audit.log_action(actor, req.session_id, "checkout_attempt", "blocked",
-                              amount_inr=total, details={"reason": e.reason})
-            raise HTTPException(403, f"blocked_by_guardrail: {e.reason}")
+            # ---- Guardrail check (bounded + gated) ----
+            try:
+                # cart_not_reviewed checked first -- a workflow precondition,
+                # ahead of the stock check below.
+                check_cart_reviewed(cart.was_cart_reviewed(req.session_id))
+                check_checkout_allowed(line_items)
+            except GuardrailBlocked as e:
+                audit.log_action(actor, req.session_id, "checkout_attempt", "blocked",
+                                  amount_inr=total, details={"reason": e.reason})
+                raise HTTPException(403, f"blocked_by_guardrail: {e.reason}")
 
-        audit.log_action(actor, req.session_id, "checkout_attempt", "ok", amount_inr=total)
+            audit.log_action(actor, req.session_id, "checkout_attempt", "ok", amount_inr=total)
 
-        # ---- Payment (with graceful-failure demo path) ----
-        description = f"Order for {req.session_id} ({len(line_items)} item(s))"
-        result, note, first_body, retry_body = payments.create_order_with_retry(
-            total, description, req.customer_contact, simulate_failure=req.simulate_failure
-        )
+            # ---- Payment (with graceful-failure demo path) ----
+            description = f"Order for {req.session_id} ({len(line_items)} item(s))"
+            result, note, first_body, retry_body = payments.create_order_with_retry(
+                total, description, req.customer_contact, simulate_failure=req.simulate_failure
+            )
 
-        if result is None:
-            audit.log_action(actor, req.session_id, "checkout_payment", "failed",
-                              amount_inr=total, details={"reason": note,
+            if result is None:
+                audit.log_action(actor, req.session_id, "checkout_payment", "failed",
+                                  amount_inr=total, details={"reason": note,
+                                                              "first_attempt_response": first_body,
+                                                              "retry_attempt_response": retry_body})
+                raise HTTPException(502, f"payment_failed: {note}")
+
+            status = "retried" if note else "ok"
+            payment_link_id = result.get("id")
+            order_id = orders.new_order_id()
+            response = {"payment_link": result.get("short_url"), "amount_inr": total,
+                        "note": note, "order_id": order_id}
+            orders.create_order(order_id, req.session_id, actor, line_items, total,
+                                 req.idempotency_key, response, payment_link_id=payment_link_id)
+
+            audit.log_action(actor, req.session_id, "checkout_payment", status,
+                              amount_inr=total, details={"payment_link": result.get("short_url"),
+                                                          "payment_link_id": payment_link_id,
+                                                          "order_id": order_id, "note": note,
                                                           "first_attempt_response": first_body,
                                                           "retry_attempt_response": retry_body})
-            raise HTTPException(502, f"payment_failed: {note}")
 
-        status = "retried" if note else "ok"
-        payment_link_id = result.get("id")
-        order_id = orders.new_order_id()
-        response = {"payment_link": result.get("short_url"), "amount_inr": total,
-                    "note": note, "order_id": order_id}
-        orders.create_order(order_id, req.session_id, actor, line_items, total,
-                             req.idempotency_key, response, payment_link_id=payment_link_id)
-
-        audit.log_action(actor, req.session_id, "checkout_payment", status,
-                          amount_inr=total, details={"payment_link": result.get("short_url"),
-                                                      "payment_link_id": payment_link_id,
-                                                      "order_id": order_id, "note": note,
-                                                      "first_attempt_response": first_body,
-                                                      "retry_attempt_response": retry_body})
-
-        cart.clear_cart(req.session_id)
-        return response
-    finally:
-        # Whatever happened -- blocked, failed, or succeeded -- the next
-        # checkout attempt needs a fresh view_cart() call; the gate
-        # can't be reused across multiple attempts.
-        cart.clear_cart_reviewed(req.session_id)
+            cart.clear_cart(req.session_id)
+            return response
+        finally:
+            # Whatever happened -- blocked, failed, or succeeded -- the next
+            # checkout attempt needs a fresh view_cart() call; the gate
+            # can't be reused across multiple attempts.
+            cart.clear_cart_reviewed(req.session_id)
 
 
 @app.post("/agent/pay")
@@ -378,76 +407,85 @@ def agent_pay(req: AgentPayRequest):
     if not req.confirm:
         raise HTTPException(400, "pay requires confirm=True after showing the buyer the cart total")
 
-    existing = orders.find_existing_order(req.session_id, req.idempotency_key)
-    if existing:
-        audit.log_action(actor, req.session_id, "checkout_replayed", "ok",
-                          amount_inr=existing["total_inr"],
-                          details={"idempotency_key": req.idempotency_key, "order_id": existing["order_id"]})
-        return existing["response"]
+    # See /checkout's identical comment -- same idempotency race, same fix.
+    with _get_session_lock(req.session_id):
+        existing = orders.find_existing_order(req.session_id, req.idempotency_key)
+        if existing:
+            audit.log_action(actor, req.session_id, "checkout_replayed", "ok",
+                              amount_inr=existing["total_inr"],
+                              details={"idempotency_key": req.idempotency_key, "order_id": existing["order_id"]})
+            return existing["response"]
 
-    line_items = cart.get_cart(req.session_id)
-    if not line_items:
-        raise HTTPException(400, "cart_empty")
+        line_items = cart.get_cart(req.session_id)
+        if not line_items:
+            raise HTTPException(400, "cart_empty")
 
-    try:
-        warrant = session["warrant"]
-        warrant_signature = session["warrant_signature"]
-        spend_today = _agent_spend_today()
-        cart_reviewed = cart.was_cart_reviewed(req.session_id)
-
-        proposal = policy.build_proposal(warrant, warrant_signature, line_items, spend_today, cart_reviewed)
-        decision = policy.evaluate(proposal)
-
-        # "Log the full decision JSON" -- every attempt, allow or
-        # block, before anything else happens.
-        audit.log_action(actor, req.session_id, "policy_decision",
-                          "ok" if decision.allow else "blocked",
-                          amount_inr=proposal.proposed_total_inr, details=decision.to_dict())
-
-        if not decision.allow:
-            raise HTTPException(403, f"blocked_by_policy: {decision.reason}")
-
-        total = proposal.proposed_total_inr
-
-        # Mirrors the human rail's checkout_attempt/ok entry so both
-        # rails' conversion-rate numbers in metrics.py stay comparable
-        # -- policy_decision above is the new, detailed explainability
-        # layer; this is the existing coarse-grained one.
-        audit.log_action(actor, req.session_id, "checkout_attempt", "ok", amount_inr=total)
-
-        receipt = f"agent-{req.session_id}-{req.idempotency_key[:8]}"
         try:
-            result = payments.create_agent_order(total, receipt, notes={"session_id": req.session_id})
-        except payments.PaymentFailure as e:
-            audit.log_action(actor, req.session_id, "checkout_payment", "failed",
-                              amount_inr=total, details={"reason": e.reason, "response": e.response_body})
-            raise HTTPException(502, f"order_creation_failed: {e.reason}")
+            warrant = session["warrant"]
+            warrant_signature = session["warrant_signature"]
+            spend_today = _agent_spend_today()
+            cart_reviewed = cart.was_cart_reviewed(req.session_id)
 
-        razorpay_order_id = result.get("id")
-        order_id = orders.new_order_id()
-        response = {"order_id": order_id, "razorpay_order_id": razorpay_order_id,
-                    "amount_inr": total, "status": "pending_capture"}
-        orders.create_order(order_id, req.session_id, actor, line_items, total,
-                             req.idempotency_key, response, razorpay_order_id=razorpay_order_id)
+            proposal = policy.build_proposal(warrant, warrant_signature, line_items, spend_today, cart_reviewed)
+            decision = policy.evaluate(proposal)
 
-        audit.log_action(actor, req.session_id, "checkout_payment", "ok", amount_inr=total,
-                          details={"razorpay_order_id": razorpay_order_id, "order_id": order_id})
+            # "Log the full decision JSON" -- every attempt, allow or
+            # block, before anything else happens.
+            audit.log_action(actor, req.session_id, "policy_decision",
+                              "ok" if decision.allow else "blocked",
+                              amount_inr=proposal.proposed_total_inr, details=decision.to_dict())
 
-        cart.clear_cart(req.session_id)
+            if not decision.allow:
+                raise HTTPException(403, f"blocked_by_policy: {decision.reason}")
 
-        # Self-complete: an AI agent has no browser to actually pay a
-        # real order in, so this demo confirms it immediately, through
-        # the EXACT SAME verification+capture function a real Razorpay
-        # webhook call would go through (see webhooks.handle_webhook).
-        capture_body = webhooks.build_capture_payload(razorpay_order_id=razorpay_order_id, amount_inr=total)
-        body_bytes = json.dumps(capture_body).encode("utf-8")
-        signature = webhooks.sign_body(body_bytes)
-        capture_result = webhooks.handle_webhook(body_bytes, signature, source="agent_pay_self_capture")
+            total = proposal.proposed_total_inr
 
-        response["status"] = "captured" if capture_result["ok"] else "capture_failed"
-        return response
-    finally:
-        cart.clear_cart_reviewed(req.session_id)
+            # Mirrors the human rail's checkout_attempt/ok entry so both
+            # rails' conversion-rate numbers in metrics.py stay comparable
+            # -- policy_decision above is the new, detailed explainability
+            # layer; this is the existing coarse-grained one.
+            audit.log_action(actor, req.session_id, "checkout_attempt", "ok", amount_inr=total)
+
+            receipt = f"agent-{req.session_id}-{req.idempotency_key[:8]}"
+            try:
+                result = payments.create_agent_order(total, receipt, notes={"session_id": req.session_id})
+            except payments.PaymentFailure as e:
+                audit.log_action(actor, req.session_id, "checkout_payment", "failed",
+                                  amount_inr=total, details={"reason": e.reason, "response": e.response_body})
+                raise HTTPException(502, f"order_creation_failed: {e.reason}")
+
+            razorpay_order_id = result.get("id")
+            order_id = orders.new_order_id()
+            response = {"order_id": order_id, "razorpay_order_id": razorpay_order_id,
+                        "amount_inr": total, "status": "pending_capture"}
+            orders.create_order(order_id, req.session_id, actor, line_items, total,
+                                 req.idempotency_key, response, razorpay_order_id=razorpay_order_id)
+
+            audit.log_action(actor, req.session_id, "checkout_payment", "ok", amount_inr=total,
+                              details={"razorpay_order_id": razorpay_order_id, "order_id": order_id})
+
+            cart.clear_cart(req.session_id)
+
+            # Self-complete: an AI agent has no browser to actually pay a
+            # real order in, so this demo confirms it immediately, through
+            # the EXACT SAME verification+capture function a real Razorpay
+            # webhook call would go through (see webhooks.handle_webhook).
+            capture_body = webhooks.build_capture_payload(razorpay_order_id=razorpay_order_id, amount_inr=total)
+            body_bytes = json.dumps(capture_body).encode("utf-8")
+            signature = webhooks.sign_body(body_bytes)
+            webhooks.handle_webhook(body_bytes, signature, source="agent_pay_self_capture")
+
+            # handle_webhook()'s own "ok" reflects whether the WEBHOOK was
+            # verified/processed, not whether the capture inside it
+            # actually succeeded (a capture_failed order still acks the
+            # webhook, same as a real Razorpay deployment would) -- re-read
+            # the order's real status rather than trusting that flag here.
+            final_order = orders.get_order(order_id)
+            response["status"] = final_order["status"]
+            orders.update_response(order_id, response)
+            return response
+        finally:
+            cart.clear_cart_reviewed(req.session_id)
 
 
 @app.get("/agent/remaining-cap")
@@ -471,6 +509,48 @@ def agent_explain_last_block(session_id: str):
         if entry["actor_id"] == session_id and entry["action"] == "policy_decision" and entry["status"] == "blocked":
             return {"decision": json.loads(entry["details"]), "timestamp": entry["timestamp"]}
     return {"decision": None, "message": "no prior blocked decision for this session"}
+
+
+@app.post("/refund")
+def refund(req: RefundRequest):
+    """
+    Reverses a CAPTURED order on either rail -- real Razorpay Refunds
+    API call first (payments.create_refund), then, only if that
+    succeeds, restores stock and marks the order refunded
+    (orders.refund_order). A session may only refund its OWN orders.
+    Full refunds only; refunding an already-refunded order is
+    idempotent (no-op, still returns success).
+    """
+    session = _require_session(req.session_id)
+    actor = session["actor"]
+
+    order = orders.get_order(req.order_id)
+    if not order:
+        raise HTTPException(404, "order_not_found")
+    if order["session_id"] != req.session_id:
+        raise HTTPException(403, "order_belongs_to_a_different_session")
+    if order["status"] == "refunded":
+        return {"order_id": req.order_id, "status": "refunded", "amount_inr": order["total_inr"]}
+    if order["status"] != "captured":
+        raise HTTPException(400, f"order_not_captured: status={order['status']}")
+
+    try:
+        payments.create_refund(order["payment_id"], order["total_inr"])
+    except payments.PaymentFailure as e:
+        audit.log_action(actor, req.session_id, "refund", "failed",
+                          amount_inr=order["total_inr"],
+                          details={"reason": e.reason, "response": e.response_body, "order_id": req.order_id})
+        raise HTTPException(502, f"refund_failed: {e.reason}")
+
+    ok, reason = orders.refund_order(req.order_id)
+    if not ok:
+        audit.log_action(actor, req.session_id, "refund", "failed",
+                          amount_inr=order["total_inr"], details={"reason": reason, "order_id": req.order_id})
+        raise HTTPException(400, reason)
+
+    audit.log_action(actor, req.session_id, "refund", "ok",
+                      amount_inr=order["total_inr"], details={"order_id": req.order_id})
+    return {"order_id": req.order_id, "status": "refunded", "amount_inr": order["total_inr"]}
 
 
 @app.post("/webhook/razorpay")

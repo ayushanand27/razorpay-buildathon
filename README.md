@@ -203,7 +203,14 @@ Shows every action from both flows, interleaved, in order.
   MCP `explain_last_block()` tool both surface this.
 - Checkout/pay is **idempotent** on `(session_id, idempotency_key)` on
   both rails — a retried/duplicated call returns the original order
-  instead of creating a second one.
+  instead of creating a second one, and this holds under genuine
+  concurrency too: a per-session lock (`main.py`) serializes a single
+  buyer's own concurrent attempts (e.g. a real network retry racing
+  the original request), while different sessions still process fully
+  in parallel. `backend/tests/test_concurrency.py` fires real
+  concurrent requests from separate threads to prove this — and proves
+  the opposite (two orders created) when the lock is removed, so the
+  test isn't passing by luck.
 - **Stock is a per-line-item invariant**, checked at checkout/pay time
   and only ever decremented at payment-capture time — never at
   order-creation time. The agent rail self-captures synchronously
@@ -217,6 +224,27 @@ Shows every action from both flows, interleaved, in order.
   docstring asks nicely for.
 - Out-of-stock items (or a requested qty exceeding what's in stock)
   are blocked before any payment is even attempted.
+
+## Refunds
+
+`POST /refund {session_id, order_id}` reverses a CAPTURED order on
+either rail: a real Razorpay Refunds API call first
+(`payments.create_refund`), and only if that succeeds, stock is
+restored and the order marked refunded (`orders.refund_order`). A
+session may only refund its own orders; refunding an already-refunded
+order is a no-op (still returns success). Refunds show up honestly in
+`GET /metrics` as `refunded_inr` and `net_revenue_inr` — `captured_inr`
+/ `total_revenue_inr` deliberately stay as the gross historical figure
+rather than silently having a refund vanish from them.
+
+**With real Razorpay keys configured, refunding a captured order will
+fail with a real 400** ("no such payment") — expected, not a bug:
+every capture in this demo is simulated (see "What's mocked vs. real"
+below), so the `payment_id` a refund would target was never a real
+Razorpay payment to begin with. In MOCK mode (no keys), refunds work
+end to end, exactly as the test suite exercises. A real refund only
+becomes meaningful once a real webhook is wired up (see "Connecting a
+real Razorpay webhook") against a real captured payment.
 
 ## The one deliberately-handled failure
 
@@ -247,29 +275,76 @@ visible, not hidden.
   swapping in Twilio's WhatsApp Sandbox is a drop-in replacement for
   `web_chat/`, not a backend change.
 
+## Persistence
+
+Sessions, carts, and orders are SQLite-backed (`sessions.db`,
+`carts.db`, `orders.db`, alongside `audit_trail.db` — all in
+`backend/app/`, all gitignored), not in-memory dicts — a backend
+restart (a redeploy, a crash) no longer silently logs out every buyer
+mid-session or drops an in-progress cart/order. Only the product
+catalog itself stays in-memory (`catalog.py`) — that's fixed demo data
+with no per-buyer state to lose. Each pytest test still gets a fully
+isolated, empty set of these files (see `backend/tests/conftest.py`),
+so tests never see real or cross-test data.
+
+## Connecting a real Razorpay webhook (optional)
+
+By default this demo confirms every payment via `POST
+/demo/simulate-capture` (see "What's mocked vs. real" above) because
+there's no public URL for Razorpay to call on `localhost`. To see a
+REAL Razorpay webhook hit `POST /webhook/razorpay` instead:
+
+1. Expose your local backend publicly, e.g. with
+   [ngrok](https://ngrok.com/) (free tier is enough):
+   ```bash
+   ngrok http 8123
+   ```
+   Note the `https://....ngrok-free.app` URL it prints.
+2. In the Razorpay Dashboard (test mode): **Settings → Webhooks → Add
+   New Webhook**. Set the URL to
+   `https://<your-ngrok-domain>/webhook/razorpay`, subscribe to the
+   `payment.captured` event, and set the webhook secret to the SAME
+   value as `RAZORPAY_WEBHOOK_SECRET` in your `.env` (or copy
+   Razorpay's generated secret into `.env` instead — either direction
+   works, they just need to match).
+3. Make sure `RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET` are set too (real
+   mode, not mock) — a payment link/order created in mock mode has no
+   real Razorpay-side payment for a webhook to ever fire about.
+4. Complete a real checkout (`/checkout`, human rail) and actually pay
+   through the returned link. Razorpay will call your ngrok URL, which
+   forwards to `/webhook/razorpay`, verified and processed by the
+   exact same `webhooks.handle_webhook()` code the local
+   `/demo/simulate-capture` stand-in already uses.
+
+This is left as a manual, opt-in step rather than something automated
+here — starting a public tunnel is a meaningful, user-visible action
+that shouldn't happen without you choosing to do it.
+
 ## Known limitations (honesty over polish)
 
-- Single demo merchant, in-memory catalog — not multi-tenant yet.
-- Sessions, orders, and carts are all in-memory — they reset with the
-  process, same as the catalog. A real deployment would persist these.
-- No refund/dispute flow yet — checkout only.
-- The MCP server's per-buyer sessions are process-local, tracked by
-  whichever agent conversation calls the tools; there's no persistent
-  buyer-identity store across separate MCP server restarts.
-- `POST /webhook/razorpay` has never actually been called by a real
-  Razorpay deployment — there's no public URL for it to reach in this
-  local setup, so it's only ever been exercised by the local
-  `/demo/simulate-capture` stand-in (same verification code, but not
-  proof the integration survives Razorpay's actual delivery behavior).
-- Groq's free tier (1,000 requests/day, shared across upsell-copy
-  generation AND chat NLU) is easy to exhaust during heavy testing or
-  a long demo session with lots of free-text turns — every call
-  degrades gracefully to a static fallback when that happens (never a
-  crash or a stuck request), but a live demo can silently lose the
-  "smart" NLU/upsell-copy behavior mid-recording if the quota runs out
-  first. The chat's fast-path (see above) and the fixed `UPSELL_MAP`
-  reason strings both reduce how often this matters, but don't
-  eliminate it — have a fresh key ready for the actual recording.
-- No concurrency/load testing — idempotency and capture-rollback are
-  proven correct for sequential requests (by the test suite), not for
-  two requests racing the same session/order at once.
+- Single demo merchant, in-memory catalog — not multi-tenant. This is
+  a deliberate scope boundary, not an oversight: the whole system
+  (one `MERCHANT_ID`, one `AGENT_WARRANT_SECRET`, one catalog) is built
+  and pitched as "agentic commerce for **a** small merchant." Real
+  multi-tenancy (per-merchant catalogs, secrets, isolated audit trails
+  and metrics, tenant routing) is a substantial redesign, not a bug fix
+  — worth doing deliberately, with its own design pass, not bolted on.
+- `POST /webhook/razorpay` has been verified against real Razorpay
+  payloads and signature verification logic, but has never actually
+  been *called* by a real Razorpay deployment in this environment —
+  see "Connecting a real Razorpay webhook" above for how to test that
+  for real when you have a public URL to give Razorpay.
+- Groq's free tier (1,000 requests/day PER KEY, shared across
+  upsell-copy generation AND chat NLU) is still finite even with the
+  fast-path and key-rotation support (`GROQ_API_KEY_2`, ...,
+  `backend/app/groq_keys.py`) — those reduce how often it's hit, they
+  don't make the quota unlimited. Every call degrades gracefully to a
+  static fallback either way (never a crash or a stuck request), but a
+  long demo can still lose the "smart" behavior mid-recording if every
+  configured key is exhausted — have a fresh key ready.
+- The MCP server's per-buyer sessions are tracked by whichever agent
+  conversation calls the tools, matched to the backend's own
+  (persisted) session store by `session_id` — there's no separate
+  buyer-identity store on the MCP server side itself.
+- No dispute/chargeback flow — refunds (see above) are the merchant's
+  own initiated reversal, not a buyer-initiated dispute process.

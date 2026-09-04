@@ -7,6 +7,13 @@ is now fixed at session-creation time and looked up from here on every
 subsequent cart/checkout call -- it is never read from a request body
 again.
 
+Persisted in SQLite (sessions.db, alongside audit_trail.db) rather than
+an in-memory dict -- a backend restart (a redeploy, a crash) no longer
+silently logs out every buyer mid-session. Each mutating call opens
+its own connection and commits immediately (same pattern as
+audit.py), with a busy_timeout so concurrent requests wait for the
+SQLite writer lock briefly instead of raising immediately.
+
 Two ways to get a session:
   - POST /session/human -- no proof required; a human is already the
     accountable party, so there's nothing to authorize beyond "you are
@@ -25,6 +32,7 @@ import hashlib
 import hmac
 import json
 import os
+import sqlite3
 import time
 import uuid
 from pathlib import Path
@@ -45,14 +53,32 @@ REQUIRED_WARRANT_FIELDS = (
     "allowed_categories", "expires_at", "nonce",
 )
 
-_SESSIONS: dict[str, dict] = {}
+DB_PATH = os.path.join(os.path.dirname(__file__), "sessions.db")
 
-# Anti-replay pool for warrant issuance (POST /session/agent). Real
-# Razorpay webhooks carry no nonce -- only a body signature -- so
-# /demo/simulate-capture doesn't use this pool; a signed capture event
-# is naturally idempotent anyway (orders.capture_order() no-ops on an
-# already-captured order).
-_USED_NONCES: set[str] = set()
+
+def _get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id TEXT PRIMARY KEY,
+            actor TEXT NOT NULL,
+            warrant TEXT,             -- JSON, NULL for human sessions
+            warrant_signature TEXT,   -- NULL for human sessions
+            created_at REAL NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS used_nonces (
+            nonce TEXT PRIMARY KEY,
+            created_at REAL NOT NULL
+        )
+        """
+    )
+    return conn
 
 
 class WarrantInvalid(Exception):
@@ -72,11 +98,19 @@ def sign_warrant(warrant: dict, secret: str | None = None) -> str:
 
 def consume_nonce(nonce: str | None) -> bool:
     """True (and marks it used) the first time a nonce is seen. False on
-    a replay or a missing nonce."""
-    if not nonce or nonce in _USED_NONCES:
+    a replay or a missing nonce. A single INSERT OR IGNORE is atomic at
+    the SQLite engine level -- two concurrent callers racing the same
+    nonce can't both "win"."""
+    if not nonce:
         return False
-    _USED_NONCES.add(nonce)
-    return True
+    conn = _get_conn()
+    try:
+        cur = conn.execute("INSERT OR IGNORE INTO used_nonces (nonce, created_at) VALUES (?, ?)",
+                            (nonce, time.time()))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
 
 
 def _verify_warrant(warrant: dict, signature: str):
@@ -97,7 +131,15 @@ def _verify_warrant(warrant: dict, signature: str):
 
 def create_human_session() -> str:
     session_id = f"human_{uuid.uuid4().hex[:12]}"
-    _SESSIONS[session_id] = {"actor": HUMAN_ACTOR, "warrant": None, "created_at": time.time()}
+    conn = _get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO sessions (session_id, actor, warrant, warrant_signature, created_at) VALUES (?, ?, ?, ?, ?)",
+            (session_id, HUMAN_ACTOR, None, None, time.time()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
     return session_id
 
 
@@ -109,10 +151,47 @@ def create_agent_session(warrant: dict, signature: str) -> str:
     expired by the time the agent actually calls POST /agent/pay."""
     _verify_warrant(warrant, signature)
     session_id = f"agent_{uuid.uuid4().hex[:12]}"
-    _SESSIONS[session_id] = {"actor": AGENT_ACTOR, "warrant": warrant,
-                              "warrant_signature": signature, "created_at": time.time()}
+    conn = _get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO sessions (session_id, actor, warrant, warrant_signature, created_at) VALUES (?, ?, ?, ?, ?)",
+            (session_id, AGENT_ACTOR, json.dumps(warrant), signature, time.time()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
     return session_id
 
 
 def get_session(session_id: str) -> dict | None:
-    return _SESSIONS.get(session_id)
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT actor, warrant, warrant_signature, created_at FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    actor, warrant_json, warrant_signature, created_at = row
+    return {
+        "actor": actor,
+        "warrant": json.loads(warrant_json) if warrant_json else None,
+        "warrant_signature": warrant_signature,
+        "created_at": created_at,
+    }
+
+
+def set_warrant_for_tests(session_id: str, warrant: dict, signature: str):
+    """Test-only helper -- overwrites an existing agent session's stored
+    warrant/signature (e.g. to simulate a warrant that has since
+    expired, or been re-signed to match a mutated warrant), the same
+    way a real re-authorization would update it."""
+    conn = _get_conn()
+    try:
+        conn.execute("UPDATE sessions SET warrant = ?, warrant_signature = ? WHERE session_id = ?",
+                      (json.dumps(warrant), signature, session_id))
+        conn.commit()
+    finally:
+        conn.close()
