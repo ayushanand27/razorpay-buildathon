@@ -25,10 +25,16 @@ def add_to_cart(session_id: str, product_id: str, qty: int = 1):
     for line in cart:
         if line["product_id"] == product_id:
             line["qty"] += qty
+            clear_cart_reviewed(session_id)
             return cart, None
 
     cart.append({"product_id": product_id, "name": product["name"],
                  "qty": qty, "price_inr": product["price_inr"]})
+    # Any mutation invalidates a prior review -- "cart_reviewed since
+    # last mutation" (policy.py rule 7) means exactly that: adding
+    # another item after a GET /cart/{session_id} review, without
+    # reviewing again, must NOT still count as reviewed.
+    clear_cart_reviewed(session_id)
     return cart, None
 
 

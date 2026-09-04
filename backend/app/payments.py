@@ -1,15 +1,30 @@
 """
-Razorpay test-mode integration via the Payment Links API.
+Razorpay test-mode integration -- two separate rails:
+
+  - create_payment_link() / create_order_with_retry(): Payment Links
+    API, the HUMAN rail (POST /checkout) -- a human opens the returned
+    URL to pay.
+  - create_agent_order(): Orders API, the AGENT rail (POST /agent/pay)
+    -- an AI agent has no browser to open a link in, so it gets a
+    Razorpay Order object instead, which this demo then confirms via a
+    signed simulate-capture call (see webhooks.py) rather than a real
+    card payment.
 
 Uses TEST mode keys only (rzp_test_...) -- get these free from the
-Razorpay Dashboard -> Settings -> API Keys (test mode toggle on).
-No real money ever moves. This module also contains the ONE
-deliberately-triggerable failure path used in the pitch video demo
-(see simulate_failure=True) -- the buildathon bar explicitly wants
-"one failure handled gracefully" shown, not just a happy path.
+Razorpay Dashboard -> Settings -> API Keys (test mode toggle on). No
+real money ever moves.
+
+The "one failure handled gracefully" demo path (simulate_failure=True
+on /checkout, human rail only) is NOT a short-circuited fake raise. It
+makes a genuinely invalid first request (amount=0), which Razorpay's
+own API genuinely rejects with a real 400, then retries once with the
+corrected amount. In mock mode (no keys configured) the same 400 JSON
+shape is simulated locally, so this path is fully testable without
+live credentials or network access.
 """
 
 import os
+import uuid
 from pathlib import Path
 
 import requests
@@ -26,34 +41,45 @@ RAZORPAY_BASE = "https://api.razorpay.com/v1"
 
 
 class PaymentFailure(Exception):
-    def __init__(self, reason: str, retryable: bool):
+    def __init__(self, reason: str, retryable: bool, response_body: dict | None = None):
         self.reason = reason
         self.retryable = retryable
+        self.response_body = response_body
         super().__init__(reason)
 
 
-def create_payment_link(amount_inr: float, description: str,
-                          customer_contact: str = "9999999999",
-                          simulate_failure: bool = False):
+def _mock_400_body(reason: str) -> dict:
+    """Same shape Razorpay's real API returns for a validation error --
+    used only in mock mode, so the retry-and-recover path is testable
+    without real keys or network access."""
+    return {
+        "error": {
+            "code": "BAD_REQUEST_ERROR",
+            "description": reason,
+            "source": "business",
+            "step": "payment_initiation",
+            "reason": "input_validation_failed",
+        }
+    }
+
+
+def create_payment_link(amount_inr: float, description: str, customer_contact: str = "9999999999"):
     """
-    Creates a Razorpay test-mode Payment Link.
+    Creates a Razorpay test-mode Payment Link for a REAL, as-given
+    amount -- this function does not special-case failure at all.
+    Callers deliberately wanting the "invalid request" failure path
+    (see create_order_with_retry) pass amount_inr=0 themselves.
 
     If RAZORPAY_KEY_ID / SECRET are not set, runs in MOCK mode so the
-    rest of the system (audit trail, guardrails, MCP tools, WhatsApp
-    flow) can be fully demoed without needing keys yet -- swap in
-    real test keys any time via a .env file, nothing else changes.
+    rest of the system can be fully demoed without needing keys yet.
     """
-    if simulate_failure:
-        # Deliberately triggered for the "one failure handled
-        # gracefully" demo -- e.g. amount below Razorpay's minimum,
-        # or an expired/invalid state.
-        raise PaymentFailure("payment_link_creation_failed_amount_too_low", retryable=True)
-
     if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
-        # MOCK MODE -- no real API call, safe for local dev/demo.
+        if amount_inr <= 0:
+            raise PaymentFailure("razorpay_api_error_400 (mock)", retryable=True,
+                                  response_body=_mock_400_body("amount must be at least 100 paise"))
         return {
-            "id": "plink_MOCK123",
-            "short_url": "https://rzp.io/l/mock-checkout-link",
+            "id": f"plink_MOCK{uuid.uuid4().hex[:10]}",
+            "short_url": f"https://rzp.io/l/mock-{uuid.uuid4().hex[:8]}",
             "status": "created",
             "amount": int(amount_inr * 100),
             "mock": True,
@@ -74,29 +100,78 @@ def create_payment_link(amount_inr: float, description: str,
         timeout=10,
     )
     if resp.status_code >= 400:
-        raise PaymentFailure(f"razorpay_api_error_{resp.status_code}: {resp.text}", retryable=True)
+        try:
+            body = resp.json()
+        except ValueError:
+            body = {"raw": resp.text}
+        raise PaymentFailure(f"razorpay_api_error_{resp.status_code}", retryable=True, response_body=body)
     return resp.json()
 
 
-def create_payment_link_with_retry(amount_inr: float, description: str,
-                                     customer_contact: str = "9999999999",
-                                     simulate_failure: bool = False):
+def create_order_with_retry(amount_inr: float, description: str,
+                              customer_contact: str = "9999999999",
+                              simulate_failure: bool = False):
     """
-    Wraps create_payment_link with ONE graceful retry using a slightly
-    adjusted request -- this is the "handled gracefully" half of the
-    demo, not just the failure itself.
+    Returns (result, note, first_attempt_response, retry_attempt_response).
+
+    When simulate_failure=True: makes a first, genuinely invalid call
+    with amount_inr=0 -- Razorpay's real API rejects this with a real
+    400 (or, with no keys configured, a realistically-shaped mock 400
+    is raised locally) -- captures that response body, then retries
+    once with the real, valid amount. `note` contains
+    "recovered_after_retry" on success after the forced failure, or
+    "failed_after_retry: ..." if even the corrected retry fails.
     """
-    try:
-        return create_payment_link(amount_inr, description, customer_contact,
-                                     simulate_failure=simulate_failure), None
-    except PaymentFailure as e:
-        if not e.retryable:
-            return None, e.reason
-        # Graceful recovery: retry once without the forced failure flag,
-        # i.e. the real, corrected request.
+    first_body = None
+    if simulate_failure:
         try:
-            result = create_payment_link(amount_inr, description, customer_contact,
-                                           simulate_failure=False)
-            return result, f"recovered_after_retry ({e.reason})"
-        except PaymentFailure as e2:
-            return None, f"failed_after_retry: {e2.reason}"
+            create_payment_link(0, description, customer_contact)
+        except PaymentFailure as e:
+            first_body = e.response_body
+
+    try:
+        result = create_payment_link(amount_inr, description, customer_contact)
+        note = "recovered_after_retry (first_attempt_amount_0)" if first_body else None
+        return result, note, first_body, (result if first_body else None)
+    except PaymentFailure as e:
+        return None, f"failed_after_retry: {e.reason}", first_body, e.response_body
+
+
+def create_agent_order(amount_inr: float, receipt: str, notes: dict | None = None) -> dict:
+    """
+    Creates a Razorpay test-mode Order (Orders API) -- the agent rail's
+    equivalent of create_payment_link(). Returns a real order object if
+    RAZORPAY_KEY_ID/SECRET are set, or a realistically-shaped mock one
+    otherwise. Raises PaymentFailure (not retryable -- there is no
+    "one failure handled gracefully" demo path on this rail) on a real
+    API error.
+    """
+    if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
+        return {
+            "id": f"order_MOCK{uuid.uuid4().hex[:10]}",
+            "amount": int(amount_inr * 100),
+            "currency": "INR",
+            "receipt": receipt,
+            "status": "created",
+            "mock": True,
+        }
+
+    payload = {
+        "amount": int(amount_inr * 100),  # paise
+        "currency": "INR",
+        "receipt": receipt,
+        "notes": notes or {},
+    }
+    resp = requests.post(
+        f"{RAZORPAY_BASE}/orders",
+        json=payload,
+        auth=HTTPBasicAuth(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
+        timeout=10,
+    )
+    if resp.status_code >= 400:
+        try:
+            body = resp.json()
+        except ValueError:
+            body = {"raw": resp.text}
+        raise PaymentFailure(f"razorpay_api_error_{resp.status_code}", retryable=False, response_body=body)
+    return resp.json()

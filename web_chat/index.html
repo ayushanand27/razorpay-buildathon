@@ -54,8 +54,17 @@
 
 <script>
 const BACKEND = "http://127.0.0.1:8123";
-const SESSION_ID = "whatsapp_" + Math.random().toString(36).slice(2, 8);
-const ACTOR = "human_whatsapp";
+// The backend no longer accepts a client-chosen session id or actor --
+// a session is established via POST /session/human on load (see init()
+// below), which is the server-side source of truth for "who is this
+// buyer" (see backend/app/sessions.py).
+let SESSION_ID = null;
+
+function newIdempotencyKey() {
+  return (window.crypto && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
 
 function log(text, cls) {
   const el = document.createElement('div');
@@ -116,7 +125,7 @@ async function showCatalog() {
 async function addItem(sku) {
   const data = await api('/cart/add', {
     method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({session_id: SESSION_ID, actor: ACTOR, product_id: sku, qty: 1})
+    body: JSON.stringify({session_id: SESSION_ID, product_id: sku, qty: 1})
   });
   if (data.detail) { bot("Couldn't add that: " + data.detail); return; }
   bot(`Added! Cart total: Rs.${data.total_inr}`);
@@ -140,7 +149,7 @@ async function doCheckout(simulateFailure=false) {
   sys("[audit] checkout_attempt logged");
   const data = await api('/checkout', {
     method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({session_id: SESSION_ID, actor: ACTOR, simulate_failure: simulateFailure})
+    body: JSON.stringify({session_id: SESSION_ID, idempotency_key: newIdempotencyKey(), simulate_failure: simulateFailure})
   });
   if (data.detail) { bot("Checkout failed: " + data.detail); sys("[audit] failure logged"); return; }
   if (data.note && data.note.includes('recovered')) {
@@ -150,37 +159,71 @@ async function doCheckout(simulateFailure=false) {
   sys("[audit] checkout_payment logged");
 }
 
+// Free-text fallback: anything that isn't one of the hardcoded
+// commands above goes to the backend's Groq-powered intent classifier
+// (POST /nlu/turn). It only ever picks a tool name (browse / add /
+// view_cart / checkout / clarify) -- the backend executes that tool
+// through the exact same cart/checkout functions the hardcoded
+// commands call, so every guardrail still applies. 3s timeout, then
+// the same fixed fallback hint the backend itself falls back to.
+async function handleFreeText(text) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 3000);
+  try {
+    const res = await fetch(BACKEND + '/nlu/turn', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({session_id: SESSION_ID, text}),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+    const data = await res.json();
+    bot(data.reply || "Try 'catalog', 'add sku_001', 'cart', or 'checkout'.");
+  } catch (err) {
+    clearTimeout(timeoutId);
+    bot("Try 'catalog', 'add sku_001', 'cart', or 'checkout'.");
+  }
+}
+
 async function send(preset) {
   const box = document.getElementById('inputBox');
   const text = preset || box.value.trim();
   if (!text) return;
+  if (!SESSION_ID) { bot("Still connecting to the store, one moment..."); return; }
   log(text, 'user');
   box.value = '';
 
+  // Exact command shortcuts stay first and unchanged -- deterministic,
+  // no network round-trip, reliable for the recorded demo.
   if (text === 'catalog') return showCatalog();
   if (text === 'cart') return showCart();
   if (text === 'checkout') return doCheckout(false);
   if (text === 'fail demo') return doCheckout(true);
   if (text.startsWith('add ')) return addItem(text.split(' ')[1].trim());
 
-  // Not a full NLU pass -- just a friendlier nudge for the demo when
-  // someone types something buy-shaped instead of the exact command.
-  if (/\b(buy|purchase|get)\b/i.test(text)) {
-    bot("Looking to buy something? Type 'catalog' to browse, then 'add sku_001' (swap in the product id) to add it to your cart.");
+  return handleFreeText(text);
+}
+
+async function init() {
+  // Establishes a server-side session (see backend/app/sessions.py) --
+  // the backend no longer accepts a client-chosen session id or a
+  // client-claimed actor.
+  const sessionData = await api('/session/human', {method: 'POST'});
+  if (sessionData.detail || !sessionData.session_id) {
+    bot(sessionData.detail || "Could not start a session with the backend.");
     return;
   }
+  SESSION_ID = sessionData.session_id;
 
-  bot("Try: 'catalog', 'add sku_001', 'cart', 'checkout', or 'fail demo'.");
+  bot("Hi! Welcome to Demo Merchant Store 👋\nType 'catalog' to see products.");
+
+  // Clicking "Buy" on catalog.html links here as index.html?buy=sku_001
+  // -- land straight in the purchase flow instead of an empty chat.
+  const buySku = new URLSearchParams(window.location.search).get('buy');
+  if (buySku) {
+    send('add ' + buySku);
+  }
 }
-
-bot("Hi! Welcome to Demo Merchant Store 👋\nType 'catalog' to see products.");
-
-// Clicking "Buy" on catalog.html links here as index.html?buy=sku_001
-// -- land straight in the purchase flow instead of an empty chat.
-const buySku = new URLSearchParams(window.location.search).get('buy');
-if (buySku) {
-  send('add ' + buySku);
-}
+init();
 </script>
 </body>
 </html>

@@ -94,12 +94,19 @@ function render(data) {
   const ai = data.revenue_by_actor.ai_agent_mcp || 0;
   const maxRevenue = Math.max(human, ai, 1);
 
+  const gap = Math.max((data.orders_created_inr || 0) - (data.captured_inr || 0), 0);
+
   content.innerHTML = `
     <div class="cards">
       <div class="card">
-        <div class="label">Total Revenue</div>
-        <div class="value">${inr(data.total_revenue_inr)}</div>
-        <div class="sub">checkout_payment, ok + retried</div>
+        <div class="label">Captured Revenue</div>
+        <div class="value">${inr(data.captured_inr)}</div>
+        <div class="sub">payment_confirmed, status=paid -- money that actually moved</div>
+      </div>
+      <div class="card">
+        <div class="label">Orders Created</div>
+        <div class="value">${inr(data.orders_created_inr)}</div>
+        <div class="sub">${gap > 0 ? inr(gap) + ' created but not yet captured' : 'fully captured'}</div>
       </div>
       <div class="card">
         <div class="label">Conversion Rate</div>
@@ -119,7 +126,7 @@ function render(data) {
     </div>
 
     <div class="panel">
-      <h2>Revenue by Actor</h2>
+      <h2>Captured Revenue by Actor</h2>
       <div class="bar-row">
         <div class="bar-label"><span>Human (WhatsApp)</span><span class="amt">${inr(human)}</span></div>
         <div class="bar-track"><div class="bar-fill human" style="width:${(human / maxRevenue * 100).toFixed(1)}%"></div></div>

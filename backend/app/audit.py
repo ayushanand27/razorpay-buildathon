@@ -61,3 +61,27 @@ def get_trail(limit: int = 100):
     conn.close()
     cols = ["id", "timestamp", "actor", "actor_id", "action", "amount_inr", "status", "details"]
     return [dict(zip(cols, r)) for r in rows]
+
+
+def captured_spend_today(actor: str) -> float:
+    """Sum of this actor's CAPTURED (payment_confirmed, status=paid)
+    transactions today -- not merely order/link-created ones. This is
+    the `spend_today` input policy.evaluate() needs for its daily-cap
+    rule; computed here (a plain query) rather than inside policy.py
+    so that module stays a pure function of its inputs, with no I/O of
+    its own."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            """
+            SELECT COALESCE(SUM(amount_inr), 0.0) FROM audit_log
+            WHERE actor = ?
+              AND action = 'payment_confirmed'
+              AND status = 'paid'
+              AND date(timestamp, 'unixepoch', 'localtime') = date('now', 'localtime')
+            """,
+            (actor,),
+        ).fetchone()
+        return row[0]
+    finally:
+        conn.close()
