@@ -460,6 +460,8 @@ def checkout(req: CheckoutRequest):
     try:
         line_items = cart.get_cart(req.session_id)
         if not line_items:
+            audit.log_action(actor, req.session_id, "checkout_attempt", "failed", merchant_id=merchant_id,
+                              amount_inr=0, details={"reason": "cart_empty"})
             raise HTTPException(400, "cart_empty")
 
         total = cart.cart_total(req.session_id)
@@ -570,6 +572,8 @@ def agent_pay(req: AgentPayRequest):
     try:
         line_items = cart.get_cart(req.session_id)
         if not line_items:
+            audit.log_action(actor, req.session_id, "checkout_attempt", "failed", merchant_id=merchant_id,
+                              amount_inr=0, details={"reason": "cart_empty"})
             raise HTTPException(400, "cart_empty")
 
         warrant = session["warrant"]

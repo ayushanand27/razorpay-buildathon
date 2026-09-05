@@ -144,6 +144,35 @@ def test_human_gated_block_without_cart_review(client):
     assert "cart_not_reviewed" in checkout_resp.json()["detail"]
 
 
+def test_human_checkout_on_empty_cart_is_logged(client):
+    """REGRESSION TEST -- a checkout attempt on an empty cart used to
+    reject with 400 cart_empty WITHOUT ever writing an audit entry,
+    even though the web chat's own UI unconditionally claims
+    "[audit] failure logged" for any checkout failure. Every rejected
+    money action must actually be explainable, not just claimed to be."""
+    session_id = make_human_session(client)
+    resp = client.post("/checkout", json={"session_id": session_id, "idempotency_key": new_idempotency_key()})
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "cart_empty"
+
+    entries = client.get("/merchants/demo_merchant/audit-trail", params={"session_id": session_id}).json()["entries"]
+    entry = next(e for e in entries if e["action"] == "checkout_attempt")
+    assert entry["status"] == "failed"
+    assert json.loads(entry["details"])["reason"] == "cart_empty"
+
+
+def test_agent_pay_on_empty_cart_is_logged(client):
+    session_id = agent_session_id(client)
+    resp = pay(client, session_id)
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "cart_empty"
+
+    entries = client.get("/merchants/demo_merchant/audit-trail", params={"session_id": session_id}).json()["entries"]
+    entry = next(e for e in entries if e["action"] == "checkout_attempt")
+    assert entry["status"] == "failed"
+    assert json.loads(entry["details"])["reason"] == "cart_empty"
+
+
 def test_human_session_cannot_use_agent_pay(client):
     session_id = make_human_session(client)
     add_and_review(client, session_id, "sku_001", qty=1)
