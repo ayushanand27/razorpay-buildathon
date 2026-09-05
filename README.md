@@ -1,6 +1,10 @@
 # Agentic Commerce for the Small Merchant
 **Razorpay AI Buildathon 2026 — Track 1: AI Growth & Agentic Commerce**
 
+[![Tests](https://github.com/ayushanand27/razorpay-buildathon/actions/workflows/tests.yml/badge.svg)](https://github.com/ayushanand27/razorpay-buildathon/actions/workflows/tests.yml)
+[![Python 3.13](https://img.shields.io/badge/python-3.13-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 ## What this is
 
 One merchant backend, **two front doors**:
