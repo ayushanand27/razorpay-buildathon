@@ -24,15 +24,18 @@ jobs:
           cache-dependency-path: backend/requirements-lock.txt
 
       - name: Install dependencies
-        # Installs from the fully-pinned lock file (direct + transitive,
-        # exact versions -- see requirements-lock.txt), not the looser
-        # requirements.txt, so a rebuild months from now can't silently
-        # resolve a different transitive dependency version.
-        # --only-binary :all: refuses to build any package from source
-        # (sdist), which would otherwise let an arbitrary setup.py/
-        # build-backend run code during install -- every pin here has a
-        # published wheel, so this never falls back to a source build.
-        run: 'pip install --only-binary :all: -r requirements-lock.txt'
+        # Installs from a fully hash-locked file (direct + transitive
+        # deps, exact versions, sha256 digest per file -- see
+        # requirements-lock.txt and generate_lock_hashes.py) instead of
+        # the looser requirements.txt. --require-hashes refuses to
+        # install anything whose downloaded bytes don't match a listed
+        # digest -- a compromised registry serving different content
+        # under the same version number is caught, not just an
+        # unpinned version. --only-binary :all: additionally refuses to
+        # build any package from source (sdist), which would otherwise
+        # let an arbitrary setup.py/build-backend run code during
+        # install -- every pin here has a published wheel already.
+        run: 'pip install --require-hashes --only-binary :all: -r requirements-lock.txt'
 
       - name: Run test suite
         run: python -m pytest -v
