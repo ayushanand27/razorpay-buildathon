@@ -75,18 +75,13 @@ const BACKEND = "http://127.0.0.1:8123";
 let SESSION_ID = null;
 
 function newIdempotencyKey() {
-  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
-  if (window.crypto && crypto.getRandomValues) {
-    // A real CSPRNG, just not the randomUUID() convenience wrapper --
-    // supported far further back than randomUUID() itself.
-    const bytes = crypto.getRandomValues(new Uint8Array(16));
-    return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
-  }
-  // Last-resort fallback for a browser with no Web Crypto API at all --
-  // an idempotency key only needs practical uniqueness (never security
-  // unpredictability), but Math.random() is avoided whenever any real
-  // CSPRNG source is available.
-  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+  if (crypto.randomUUID) return crypto.randomUUID();
+  // crypto.getRandomValues() (a real CSPRNG, just not the randomUUID()
+  // convenience wrapper) is supported in every browser capable of
+  // running the rest of this page (fetch, async/await, arrow
+  // functions) -- no Math.random() fallback needed or kept.
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
 }
 
 function log(text, cls) {
