@@ -46,42 +46,35 @@ Each word of that maps directly to a module:
 
 ```mermaid
 flowchart TB
-    H["Human buyer<br/>web_chat/*.html<br/>(WhatsApp-style chat)"]
-    A["AI agent (Claude)<br/>via mcp_server/server.py<br/>(browse_catalog, add_to_cart, pay,<br/>remaining_cap, explain_last_block)"]
+    H["Human buyer<br/>web_chat/*.html"]
+    A["AI agent (Claude)<br/>via mcp_server/server.py"]
+    M["main.py + sessions.py<br/>resolves actor + merchant_id server-side,<br/>never trusted from the request body"]
+    CAT["catalog.py + cart.py<br/>shared by BOTH rails, never duplicated"]
+    GR["guardrails.py — HUMAN rail<br/>POST /checkout: cart reviewed + stock check"]
+    POL["policy.py — AGENT rail<br/>POST /agent/pay: 8-rule engine — warrant<br/>valid+fresh, category, price-tamper,<br/>per-tx + daily cap, cart reviewed, stock"]
+    PAY1["payments.py<br/>Razorpay Payment Links"]
+    PAY2["payments.py<br/>Razorpay Orders API"]
+    RZP["Razorpay (test mode)"]
+    WH["webhooks.py<br/>HMAC-SHA256 verify +<br/>created_at freshness check"]
+    DB[("db.py — ONE SQLite database, app.db (SQLModel)<br/>merchants, sessions, carts, orders,<br/>idempotency, audit_log — atomic transactions")]
+    MR["merchant_registry.py<br/>runtime provisioning, no redeploy"]
+    DASH["audit-dashboard.html + metrics.html<br/>merchant-scoped, session-gated reads"]
 
-    H -->|"POST /session/human<br/>(no warrant)"| M
-    A -->|"POST /session/agent<br/>(signed spending warrant)"| M
-
-    subgraph Backend["backend/app — FastAPI, single source of truth"]
-        M["main.py + sessions.py<br/>resolves actor + merchant_id server-side —<br/>never trusted from the request body"]
-        CAT["catalog.py + cart.py<br/>shared by BOTH rails, never duplicated"]
-        M --> CAT
-
-        GR["guardrails.py — HUMAN rail<br/>cart reviewed + stock check"]
-        POL["policy.py — AGENT rail<br/>8-rule engine: warrant valid + fresh,<br/>category allow-list, price-tamper check,<br/>per-tx + daily cap, cart reviewed, stock"]
-        CAT -->|"POST /checkout"| GR
-        CAT -->|"POST /agent/pay"| POL
-
-        PAY1["payments.py<br/>Razorpay Payment Links"]
-        PAY2["payments.py<br/>Razorpay Orders API"]
-        GR --> PAY1
-        POL --> PAY2
-
-        WH["webhooks.py<br/>HMAC-SHA256 signature verify +<br/>created_at freshness check"]
-        PAY1 --> WH
-        PAY2 --> WH
-
-        DB[("db.py — ONE SQLite database (app.db), SQLModel<br/>merchants · sessions · carts · orders<br/>idempotency · audit_log — atomic transactions")]
-        WH --> DB
-        M -.->|"merchant_registry.py<br/>dynamic provisioning, no redeploy"| DB
-    end
-
-    RZP["Razorpay (test mode)<br/>Payment Links API / Orders API"]
-    PAY1 -.-> RZP
-    PAY2 -.-> RZP
-    RZP -.->|"real webhook via ngrok:<br/>payment.captured / payment_link.paid<br/>(or /demo/simulate-capture locally)"| WH
-
-    DASH["web_chat/audit-dashboard.html<br/>+ metrics.html<br/>(merchant-scoped, session-gated reads)"]
+    H --> M
+    A --> M
+    M --> CAT
+    CAT --> GR
+    CAT --> POL
+    GR --> PAY1
+    POL --> PAY2
+    PAY1 --> RZP
+    PAY2 --> RZP
+    RZP --> WH
+    PAY1 --> WH
+    PAY2 --> WH
+    WH --> DB
+    M --> DB
+    MR --> DB
     DB --> DASH
 ```
 
