@@ -161,12 +161,18 @@ Then point your MCP client's config at the `mcp_client_config.json`
 this writes (see `mcp_client_config.example.json` for the raw format
 if you'd rather wire it up by hand). Restart the client, and ask it to
 "browse the demo merchant's catalog and buy me a water bottle" — it
-will call the tools live: `browse_catalog`, `add_to_cart`, `view_cart`,
-`pay`, plus `remaining_cap` and `explain_last_block` for the agent to
-check its own spending room or understand a block. Sessions are
-per-buyer (each tool call accepts an optional `session_id`, minting one
-on first use if omitted), not fixed once at server startup. The full
-catalog is also exposed as an MCP resource, `merchant://catalog`.
+will call the tools live: `browse_catalog`, `add_to_cart`,
+`remove_from_cart`, `view_cart`, `pay`, `refund`, plus `remaining_cap`
+and `explain_last_block` for the agent to check its own spending room
+or understand a block, and `get_metrics`/`list_merchants` for
+read-only growth/merchant info. `start_new_session` explicitly mints a
+genuinely fresh session (empty cart, full daily cap) rather than
+reusing whatever default session already exists — use it if a cart
+ever ends up in a state `remove_from_cart`/`add_to_cart` can't fix.
+Sessions are per-buyer (each tool call accepts an optional
+`session_id`, minting one on first use if omitted), not fixed once at
+server startup. The full catalog is also exposed as an MCP resource,
+`merchant://catalog`.
 
 ### 4. Audit trail
 ```
