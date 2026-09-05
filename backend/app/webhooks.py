@@ -168,7 +168,25 @@ def handle_webhook(body: bytes, signature: str, source: str = "webhook") -> dict
                           details={"reason": "payload_not_a_json_object", "source": source})
         return {"ok": False, "reason": "invalid_payload"}
 
-    created_at = payload.get("created_at")
+    payment_entity = _dig(payload, "payload", "payment", "entity")
+
+    # Real Razorpay behavior, confirmed against a live payment_link.paid
+    # delivery: the EVENT's own top-level created_at is NOT "when this
+    # webhook fired" for that event type -- it's identical, byte for
+    # byte, to payload.payment_link.entity.created_at, i.e. when the
+    # PAYMENT LINK was created. A real customer can take anywhere from
+    # seconds to hours to actually pay a link, so gating freshness on
+    # link-creation time rejects nearly every real payment_link.paid
+    # delivery as "expired" -- this is what happened on a live test.
+    # payload.payment.entity.created_at is the moment money actually
+    # moved, which is the correct thing to measure staleness against,
+    # regardless of which wrapper event delivered it. Fall back to the
+    # top-level created_at only when there's no payment entity at all
+    # (an event type this system doesn't otherwise act on anyway).
+    created_at = payment_entity.get("created_at") if payment_entity else None
+    if created_at is None:
+        created_at = payload.get("created_at")
+
     if not isinstance(created_at, (int, float)):
         audit.log_action("razorpay_webhook", "unknown", "webhook_received", "expired_timestamp",
                           details={"reason": "missing_or_invalid_created_at", "source": source})
@@ -182,7 +200,6 @@ def handle_webhook(body: bytes, signature: str, source: str = "webhook") -> dict
         return {"ok": False, "reason": "expired_timestamp"}
 
     event = payload.get("event") or ""
-    payment_entity = _dig(payload, "payload", "payment", "entity")
     audit.log_action("razorpay_webhook", payment_entity.get("id", "unknown"), "webhook_received",
                       "verified", details={"event": event, "source": source})
 

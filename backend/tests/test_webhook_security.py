@@ -170,6 +170,63 @@ def test_webhook_expired_timestamp_rejected_even_with_valid_signature(client):
     assert resp.json()["detail"] == "expired_timestamp"
 
 
+def test_webhook_stale_top_level_created_at_does_not_reject_a_fresh_payment(client):
+    """REGRESSION TEST for a bug found via a live payment_link.paid
+    delivery: the event's top-level created_at is identical to
+    payload.payment_link.entity.created_at -- i.e. when the payment
+    LINK was created, NOT when the event fired. A real customer can
+    take minutes or hours to actually pay a link, so an old top-level
+    created_at must NOT reject an otherwise-fresh payment -- freshness
+    has to be measured against payload.payment.entity.created_at (when
+    money actually moved), which is what this test's payload sets to
+    right now despite the top-level field being an hour old."""
+    session_id, payment_link_id, amount = _human_order(client)
+    old_link_created_at = int(time.time()) - 3600  # link "created" an hour ago
+    fresh_payment_time = int(time.time())  # but paid just now
+    payload = {
+        "entity": "event", "account_id": "acc_test", "event": "payment_link.paid",
+        "contains": ["payment_link", "order", "payment"],
+        "created_at": old_link_created_at,  # ONLY the link-creation timestamp, deliberately stale
+        "payload": {
+            "payment_link": {"entity": {"id": payment_link_id, "status": "paid",
+                                          "created_at": old_link_created_at}},
+            "payment": {"entity": {"id": f"pay_{uuid.uuid4().hex[:14]}", "amount": int(amount * 100),
+                                     "status": "captured", "created_at": fresh_payment_time}},
+        },
+    }
+    body_bytes = json.dumps(payload).encode("utf-8")
+    sig = _sign(body_bytes)
+
+    resp = _post_webhook(client, body_bytes, sig)
+    assert resp.status_code == 200
+
+    entries = client.get("/merchants/demo_merchant/audit-trail", params={"session_id": session_id}).json()["entries"]
+    confirmed = next(e for e in entries if e["action"] == "payment_confirmed")
+    assert confirmed["status"] == "paid"
+
+
+def test_webhook_stale_payment_entity_created_at_still_rejected(client):
+    """The freshness check still has teeth once correctly anchored --
+    a payment.entity.created_at that's genuinely old must still be
+    rejected, even if the top-level created_at were somehow fresh."""
+    payload = {
+        "entity": "event", "account_id": "acc_test", "event": "payment_link.paid",
+        "contains": ["payment_link", "payment"],
+        "created_at": int(time.time()),  # fresh top-level, deliberately irrelevant now
+        "payload": {
+            "payment_link": {"entity": {"id": "plink_doesnotexist", "status": "paid"}},
+            "payment": {"entity": {"id": "pay_old", "amount": 10000, "status": "captured",
+                                     "created_at": int(time.time()) - 3600}},
+        },
+    }
+    body_bytes = json.dumps(payload).encode("utf-8")
+    sig = _sign(body_bytes)
+
+    resp = _post_webhook(client, body_bytes, sig)
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "expired_timestamp"
+
+
 def test_webhook_future_timestamp_beyond_clock_skew_rejected(client):
     future_created_at = int(time.time()) + 3600
     payload = _real_shaped_payment_captured_payload(payment_link_id="plink_doesnotexist", created_at=future_created_at)
@@ -182,11 +239,16 @@ def test_webhook_future_timestamp_beyond_clock_skew_rejected(client):
 
 
 def test_webhook_missing_created_at_rejected(client):
-    """A real Razorpay webhook always carries created_at -- a payload
-    shaped like one but missing it entirely is treated as invalid, not
-    silently allowed through with no freshness check at all."""
+    """A real Razorpay webhook always carries created_at somewhere -- a
+    payload missing it entirely (both the top-level field AND the
+    payment entity's own, which is the one actually used for freshness
+    now -- see the payment_link.paid regression above) is treated as
+    invalid, not silently allowed through with no freshness check at
+    all. Deleting only the top-level field isn't enough on its own
+    anymore: payload.payment.entity.created_at is checked first."""
     payload = _real_shaped_payment_captured_payload(payment_link_id="plink_doesnotexist")
     del payload["created_at"]
+    del payload["payload"]["payment"]["entity"]["created_at"]
     body_bytes = json.dumps(payload).encode("utf-8")
     sig = _sign(body_bytes)
 
