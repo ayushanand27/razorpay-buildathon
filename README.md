@@ -44,34 +44,57 @@ Each word of that maps directly to a module:
 
 ## Architecture
 
-```
-                     ┌─────────────────────────────┐
-  Human (WhatsApp)   │     backend/app (FastAPI)    │   AI agent
-  web_chat/index.html│                              │   (via MCP)
-        │  session   │ sessions.py   catalog.py     │  signed warrant
-        │  (no       │ cart.py       orders.py      │  + session
-        │  warrant)  │                              │        │
-        └───────────►│ POST /checkout   POST /agent/pay      │
-                      │  guardrails.py     policy.py │◄───────┘
-                      │  (review + stock)  (8 rules, │   mcp_server/server.py
-                      │       │                │     │  (browse_catalog,
-                      │  Payment Links    Orders API │   add_to_cart, pay,
-                      │  (payments.py)   (payments.py)│  remaining_cap,
-                      │       │                │     │   explain_last_block)
-                      │       └──── webhooks.py ─────┤
-                      │        (real webhook OR       │
-                      │      /demo/simulate-capture,   │
-                      │       same verification)       │
-                      │        audit.py (SQLite)       │
-                      └─────────────────────────────┘
+```mermaid
+flowchart TB
+    H["Human buyer<br/>web_chat/*.html<br/>(WhatsApp-style chat)"]
+    A["AI agent (Claude)<br/>via mcp_server/server.py<br/>(browse_catalog, add_to_cart, pay,<br/>remaining_cap, explain_last_block)"]
+
+    H -->|"POST /session/human<br/>(no warrant)"| M
+    A -->|"POST /session/agent<br/>(signed spending warrant)"| M
+
+    subgraph Backend["backend/app — FastAPI, single source of truth"]
+        M["main.py + sessions.py<br/>resolves actor + merchant_id server-side —<br/>never trusted from the request body"]
+        CAT["catalog.py + cart.py<br/>shared by BOTH rails, never duplicated"]
+        M --> CAT
+
+        GR["guardrails.py — HUMAN rail<br/>cart reviewed + stock check"]
+        POL["policy.py — AGENT rail<br/>8-rule engine: warrant valid + fresh,<br/>category allow-list, price-tamper check,<br/>per-tx + daily cap, cart reviewed, stock"]
+        CAT -->|"POST /checkout"| GR
+        CAT -->|"POST /agent/pay"| POL
+
+        PAY1["payments.py<br/>Razorpay Payment Links"]
+        PAY2["payments.py<br/>Razorpay Orders API"]
+        GR --> PAY1
+        POL --> PAY2
+
+        WH["webhooks.py<br/>HMAC-SHA256 signature verify +<br/>created_at freshness check"]
+        PAY1 --> WH
+        PAY2 --> WH
+
+        DB[("db.py — ONE SQLite database (app.db), SQLModel<br/>merchants · sessions · carts · orders<br/>idempotency · audit_log — atomic transactions")]
+        WH --> DB
+        M -.->|"merchant_registry.py<br/>dynamic provisioning, no redeploy"| DB
+    end
+
+    RZP["Razorpay (test mode)<br/>Payment Links API / Orders API"]
+    PAY1 -.-> RZP
+    PAY2 -.-> RZP
+    RZP -.->|"real webhook via ngrok:<br/>payment.captured / payment_link.paid<br/>(or /demo/simulate-capture locally)"| WH
+
+    DASH["web_chat/audit-dashboard.html<br/>+ metrics.html<br/>(merchant-scoped, session-gated reads)"]
+    DB --> DASH
 ```
 
-Single source of truth = the FastAPI backend. Catalog, cart, and audit
-logic are never duplicated between the two front doors; payment is
-deliberately split into two rails (human vs. agent) with their own
-guard modules, since a browser-based Payment Link and an
-agent-appropriate Orders-API-plus-policy-check are genuinely different
-shapes of "pay for this."
+Single source of truth = the FastAPI backend, backed by one SQLite
+database (`backend/app/app.db`, via SQLAlchemy/SQLModel — see
+"Persistence" below). Catalog, cart, and audit logic are never
+duplicated between the two front doors; payment is deliberately split
+into two rails (human vs. agent) with their own guard modules, since a
+browser-based Payment Link and an agent-appropriate
+Orders-API-plus-policy-check are genuinely different shapes of "pay
+for this." Every merchant — including one provisioned at runtime via
+`POST /merchants`, not just the two seeded demo merchants — flows
+through this exact same diagram; nothing here is hardcoded per-tenant.
 
 ## Stack (100% free, no paid tools used to build this)
 
