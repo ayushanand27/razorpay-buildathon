@@ -21,10 +21,18 @@ jobs:
         with:
           python-version: "3.13"
           cache: "pip"
-          cache-dependency-path: backend/requirements.txt
+          cache-dependency-path: backend/requirements-lock.txt
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        # Installs from the fully-pinned lock file (direct + transitive,
+        # exact versions -- see requirements-lock.txt), not the looser
+        # requirements.txt, so a rebuild months from now can't silently
+        # resolve a different transitive dependency version.
+        # --only-binary :all: refuses to build any package from source
+        # (sdist), which would otherwise let an arbitrary setup.py/
+        # build-backend run code during install -- every pin here has a
+        # published wheel, so this never falls back to a source build.
+        run: 'pip install --only-binary :all: -r requirements-lock.txt'
 
       - name: Run test suite
         run: python -m pytest -v

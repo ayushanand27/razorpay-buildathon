@@ -61,7 +61,7 @@
     <button onclick="send('fail demo')">Trigger failure demo</button>
   </div>
   <div id="inputRow">
-    <input id="inputBox" placeholder="Type a message..." autofocus onkeydown="if(event.key==='Enter')send()"/>
+    <input id="inputBox" placeholder="Type a message..." aria-label="Chat message" autofocus onkeydown="if(event.key==='Enter')send()"/>
     <button id="sendBtn" onclick="send()">Send</button>
   </div>
 </div>
@@ -75,9 +75,18 @@ const BACKEND = "http://127.0.0.1:8123";
 let SESSION_ID = null;
 
 function newIdempotencyKey() {
-  return (window.crypto && crypto.randomUUID)
-    ? crypto.randomUUID()
-    : Math.random().toString(36).slice(2) + Date.now().toString(36);
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  if (window.crypto && crypto.getRandomValues) {
+    // A real CSPRNG, just not the randomUUID() convenience wrapper --
+    // supported far further back than randomUUID() itself.
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+  }
+  // Last-resort fallback for a browser with no Web Crypto API at all --
+  // an idempotency key only needs practical uniqueness (never security
+  // unpredictability), but Math.random() is avoided whenever any real
+  // CSPRNG source is available.
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
 function log(text, cls) {

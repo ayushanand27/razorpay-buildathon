@@ -65,7 +65,7 @@ FALLBACK_MESSAGE = "Try 'catalog', 'add sku_001', 'cart', or 'checkout'."
 
 _PRICE_CEILING_RE = re.compile(r"\b(?:under|below|less than)\s+(?:rs\.?\s*)?(\d+)", re.IGNORECASE)
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
-_MARKDOWN_FENCE_RE = re.compile(r"^```(?:json)?|```$", re.MULTILINE)
+_MARKDOWN_FENCE_RE = re.compile(r"(?:^```(?:json)?)|(?:```$)", re.MULTILINE)
 _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 # Cheap, exact-ish local matches for the handful of intents that don't
